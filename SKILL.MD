@@ -26,6 +26,19 @@ Always clarify scope before starting (or auto-detect in autonomous mode):
 - `module:<path>` — specific folder/module only (e.g. `module:src/payments`)
 **Note on module scope:** architectural decisions for a module are often partially implemented outside it (e.g. shared event bus, config changes). When scoping to a module path, also scan `-- <module-path>` diffs AND flag any commits that touch both the module path and shared paths (`lib/`, `core/`, `shared/`, `common/`) — include those as candidates even if they partially fall outside scope.
  
+### Output Location (scope-aware)
+ 
+Where ADRs are written depends on code scope. Do NOT dump module ADRs into the global pool — co-locate them with the module so they stay discoverable and numbering does not collide across modules.
+ 
+| Code scope | Output directory | Numbering |
+|------------|------------------|-----------|
+| `repo` | `docs/decisions/` | continues from highest existing global ADR |
+| `module:<path>` | `<path>/docs/decisions/` (co-located) | numbered independently per module, continues from highest existing ADR in that folder |
+ 
+**Boundary-crossing decisions:** when a module-scoped decision also touches shared paths (`lib/`, `core/`, etc.), write the ADR in the module's folder, but place the `@ADR` tag in the shared file too — pointing back across the boundary to the module's decision file. This keeps the single source of truth in the module while making the decision discoverable from the shared code.
+ 
+Throughout the rest of this skill, `docs/decisions/` refers to the **scope-resolved** output directory from this table, not necessarily the repo root.
+ 
 ---
  
 ## Core Loop
@@ -33,9 +46,10 @@ Always clarify scope before starting (or auto-detect in autonomous mode):
 ```
 0. PREFLIGHT  → validate repo state before doing anything
 1. DETECT     → chunking strategy (merge / squash / rebase / direct)
-2. CHUNK      → group commits into logical decision units
+2. CHUNK      → group commits within boundaries into logical units
+2.5 CLUSTER   → merge related chunks ACROSS boundaries into decision candidates
 3. CLASSIFY   → filter architectural decisions from noise
-4. GENERATE   → produce MADR per decision (batch-aware)
+4. GENERATE   → produce MADR per decision candidate (batch-aware)
 5. TAG        → place @ADR inline markers in code
 ```
  
@@ -153,6 +167,30 @@ In **assisted mode**, show proposed chunk list (commit count per chunk, not full
  
 ---
  
+## Step 2.5: Cluster Across Boundaries
+ 
+**Do not assume one PR/merge = one decision.** A single architectural decision often lands across several PRs over weeks, interleaved with unrelated work (e.g. an event-driven migration spread across PR #210, #230, #255). One ADR per boundary shatters that into three weak, redundant records. Step 2 groups *within* a boundary; this step merges *across* boundaries into **decision candidates**.
+ 
+This pass is **deterministic by design** — no embeddings, no temporal proximity. It uses signals already extracted in Step 2 so that re-runs are reproducible (which is what makes the skill eval-able and regression-testable).
+ 
+**Merge two chunks (even non-adjacent ones) into one candidate when BOTH hold:**
+1. **File overlap** — they touch an overlapping set of files or share ≥2 top-level directories, OR one chunk adds a file/symbol the other modifies.
+2. **Topic affinity** — their commit/PR subjects share a distinctive token (a library name, subsystem, feature flag, or migration name like `kafka`, `grpc`, `hexagonal`) — not generic words like `fix`, `add`, `update`.
+ 
+**Guards:**
+- A merged candidate may span non-sequential PRs/commits — that is the point. Order its links by author date.
+- Cap a candidate at ~8 source chunks; if larger, it is probably several decisions — keep the strongest file-overlap cluster and split the rest.
+- Do NOT merge on topic affinity alone (two unrelated `cache` PRs) or file overlap alone (everyone edits `config.ts`). Require both.
+- A chunk that clusters with nothing stays a singleton candidate — that is fine.
+ 
+The output of this step is a list of **decision candidates**, each backed by one or more chunks. Steps 3–5 operate on candidates, not raw chunks.
+ 
+> **v2 note (not implemented here):** semantic clustering via embeddings + graph community detection would also catch conceptually-related PRs that share no files. It is deliberately out of scope: it is non-deterministic, needs a vector store, and would make output impossible to regression-test. Prototype it offline and prove it beats this deterministic pass before adopting it.
+ 
+In **assisted mode**, show the proposed candidates (which chunks merged into each, and why) and let the user split/merge before classifying.
+ 
+---
+ 
 ## Step 3: Classify Chunks
  
 For each chunk, classify using **diff-first** scoring — commit messages are a weak signal, diff content is the primary signal.
@@ -207,6 +245,12 @@ In **assisted mode**, show the full classification table including BORDERLINEs w
  
 Process one chunk at a time. Write each file to disk before moving to the next — do not batch in context.
  
+### Hard gate: diff before draft
+ 
+**Before writing ANY MADR, you MUST have loaded and read the chunk's actual diff** (`git diff $BASE $COMMIT -- [module-path]`). The commit subject or PR/merge title is NOT sufficient — it may seed the title only. This is the most common failure mode: for merge/squash commits the subject line is right there ("Merge PR #214: add caching") and it is tempting to write the ADR straight from it. Do not. If you have not read the diff for this chunk, go back to Step 2 and load it before generating.
+ 
+**Thin-message rule (mirror of the Considered-Options rule):** when the commit/PR message is uninformative (`wip`, `fix`, `Merge #214`, empty), the Context, Decision, and Outcome MUST be reconstructed from the **diff** — new files, deleted code, dependency/schema changes — not paraphrased from the subject line. If the diff is *also* uninformative, say so explicitly ("Implementation inferred from diff; no clear rationale recoverable") rather than restating the PR title as if it were a decision.
+ 
 ### Numbering and deduplication
  
 ```bash
@@ -214,9 +258,11 @@ Process one chunk at a time. Write each file to disk before moving to the next �
 ls docs/decisions/ 2>/dev/null | grep -E "^[0-9]{4}-" | sort | tail -1
 ```
  
-Number sequentially from the next available. Order by commit date (author date, `--format="%ad"`) not commit date, since rebase/cherry-pick skews commit timestamps.
+Number sequentially from the next available. Order by **author date** (`--format="%ad"`), not committer date (`%cd`), since rebase/cherry-pick rewrites committer timestamps while preserving original author dates.
  
 ### MADR Template
+ 
+**Title rule:** the title states the *decision*, not the PR. `Merge #214` or `add caching` is a PR title; `Adopt Redis for session cache` is a decision title. Derive it from what the diff actually did, not from the commit subject.
  
 ```markdown
 # <short decision title>
@@ -313,7 +359,8 @@ git diff $BASE $COMMIT -- [module-path] | grep -E "^(\+){1}[^+].*(def |class |fu
 | Rust | `// @ADR-...` | `// @ADR-...` |
 | Ruby | `# @ADR-...` | `# @ADR-...` |
 | Shell | `# @ADR-...` | n/a |
-| YAML/JSON/TOML | **SKIP — no comment syntax** | |
+| JSON | **SKIP — no comment syntax** | |
+| YAML/TOML | **SKIP — supports `#` but fragile; formatters/tools may strip inline comments. Tag the code that reads the config instead.** | |
  
 In **assisted mode**, show proposed placements with file + line before writing:
 ```
