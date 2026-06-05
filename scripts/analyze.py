@@ -29,6 +29,9 @@ from typing import Optional
 
 # --- constants ---------------------------------------------------------------
 
+COUPLING_MIN_SHARED = 5   # Tornhill's empirical minimums from code-maat
+COUPLING_MIN_SCORE  = 0.30
+
 DEP_FILES = {
     "package.json", "requirements.txt", "go.mod", "cargo.toml",
     "pom.xml", "build.gradle", "pipfile", "pyproject.toml", "gemfile",
@@ -300,28 +303,77 @@ def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
 
 
 def chunk_commits(commits: list[Commit], strategy: str,
-                  cfg: Config) -> list[list[Commit]]:
+                  cfg: Config, coupling: Optional[dict] = None) -> list[list[Commit]]:
     """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster()."""
     if strategy in ("squash-boundary", "merge-boundary", "mixed"):
         # each commit is its own chunk; cluster() bundles related ones
         return [[c] for c in commits]
     # direct-commit: union-find by file-path affinity (no temporal grouping)
-    return _affinity_groups(commits, cfg)
+    return _affinity_groups(commits, cfg, coupling=coupling)
+
+
+def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
+    """Return frozenset({fileA, fileB}) → Jaccard coupling score over full history.
+
+    Only pairs with ≥COUPLING_MIN_SHARED co-appearances and a score
+    ≥COUPLING_MIN_SCORE are kept — Tornhill's empirical minimums.
+    Always mines the full history regardless of the analysis rev_range, since
+    coupling is a global prior, not scoped to the current window.
+    """
+    commits = parse_log(repo, rev_range=None, pathspec=pathspec, no_merges=True)
+    file_revs: dict[str, int] = {}
+    pair_revs: dict = {}
+    for c in commits:
+        paths = list({f.path for f in c.files})
+        for p in paths:
+            file_revs[p] = file_revs.get(p, 0) + 1
+        for i in range(len(paths)):
+            for j in range(i + 1, len(paths)):
+                key = frozenset({paths[i], paths[j]})
+                pair_revs[key] = pair_revs.get(key, 0) + 1
+
+    coupling: dict = {}
+    for pair, shared in pair_revs.items():
+        if shared < COUPLING_MIN_SHARED:
+            continue
+        a, b = tuple(pair)
+        denom = file_revs[a] + file_revs[b] - shared
+        score = shared / denom if denom else 0.0
+        if score >= COUPLING_MIN_SCORE:
+            coupling[pair] = score
+    return coupling
+
+
+def _coupled(a_paths: set[str], b_paths: set[str], coupling: dict) -> bool:
+    """True if any cross-pair (fileA ∈ A, fileB ∈ B) meets the coupling threshold."""
+    for pa in a_paths:
+        for pb in b_paths:
+            if coupling.get(frozenset({pa, pb}), 0.0) >= COUPLING_MIN_SCORE:
+                return True
+    return False
 
 
 def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str],
-            a_paths: set[str], b_paths: set[str]) -> bool:
-    """Merge rule: BOTH a file/dir overlap AND a distinctive topic-token overlap.
+            a_paths: set[str], b_paths: set[str], coupling: Optional[dict] = None) -> bool:
+    """Merge when ≥2 of 3 independent signals agree.
 
-    Requiring both prevents the two classic false merges: 'everyone edits the
-    same generic file' (file-only) and 'two unrelated cache PRs' (topic-only).
+    1. file/dir overlap    — same files or deep-directory prefix
+    2. topic-token overlap — distinctive words from commit messages / new-file names
+    3. co-change coupling  — historical Jaccard coupling from full repo history
+
+    Requiring two independent signals prevents the classic false-merge pairs:
+    file-only ('everyone edits the same generic file') and topic-only ('two
+    unrelated cache PRs'). Coupling as a third signal raises recall for commits
+    that share no files in this window but always co-change in history.
     """
-    file_overlap = bool(a_paths & b_paths) or bool(a_dirs & b_dirs)
+    file_overlap  = bool(a_paths & b_paths) or bool(a_dirs & b_dirs)
     topic_overlap = bool(a_tok & b_tok)
-    return file_overlap and topic_overlap
+    coupled       = _coupled(a_paths, b_paths, coupling) if coupling else False
+    return sum([file_overlap, topic_overlap, coupled]) >= 2
 
 
-def _affinity_groups(commits: list[Commit], cfg: Config) -> list[list[Commit]]:
+def _affinity_groups(commits: list[Commit], cfg: Config,
+                     coupling: Optional[dict] = None) -> list[list[Commit]]:
     n = len(commits)
     parent = list(range(n))
 
@@ -340,6 +392,7 @@ def _affinity_groups(commits: list[Commit], cfg: Config) -> list[list[Commit]]:
                 commits[i].dirs_deep(cfg), commits[j].dirs_deep(cfg),
                 commits[i].topic_tokens(cfg), commits[j].topic_tokens(cfg),
                 commits[i].paths, commits[j].paths,
+                coupling=coupling,
             ):
                 union(i, j)
 
@@ -350,14 +403,13 @@ def _affinity_groups(commits: list[Commit], cfg: Config) -> list[list[Commit]]:
     return sorted(groups.values(), key=lambda g: min(c.date for c in g))
 
 
-def cluster(chunks: list[list[Commit]], cfg: Config) -> list[list[Commit]]:
+def cluster(chunks: list[list[Commit]], cfg: Config,
+            coupling: Optional[dict] = None) -> list[list[Commit]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
-    Merge when BOTH hold: file overlap AND topic-token overlap. Deterministic.
-
-    Oversized clusters (> cfg.cluster_cap commits) are either split into
-    date-ordered sub-clusters of <= cap (when cfg.split_oversized) or kept whole
-    and flagged for the caller via classify()'s oversize signal.
+    Merge when ≥2 of 3 signals agree: file overlap, topic-token overlap,
+    co-change coupling. Deterministic. Oversized clusters (> cfg.cluster_cap
+    commits) are split when cfg.split_oversized, else kept whole.
     """
     m = len(chunks)
     parent = list(range(m))
@@ -384,7 +436,7 @@ def cluster(chunks: list[list[Commit]], cfg: Config) -> list[list[Commit]]:
         for j in range(i + 1, m):
             di, ti, pi = aggs[i]
             dj, tj, pj = aggs[j]
-            if _shares(di, dj, ti, tj, pi, pj):
+            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling):
                 union(i, j)
 
     groups: dict[int, list[Commit]] = {}
@@ -524,8 +576,9 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
 
     strategy = detect_strategy(repo, pathspec)
     commits = parse_log(repo, rev_range, pathspec)
-    chunks = chunk_commits(commits, strategy, cfg)
-    clusters = cluster(chunks, cfg)
+    coupling = build_coupling(repo, pathspec)
+    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling)
+    clusters = cluster(chunks, cfg, coupling=coupling)
 
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
