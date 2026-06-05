@@ -4,27 +4,31 @@ judge.py — output-safety layer for the adr-generator skill.
 
 The deterministic pipeline (analyze.py) decides *which* commits become ADR
 candidates. This module guards the *output* the agent then produces, with two
-independent checks the previous design called the "LLM-judge pass":
+DETERMINISTIC checks — no model on either path:
 
-  1. check_tag_syntax  — DETERMINISTIC. After @ADR comment tags are placed in a
-     source file, the file must still parse. No model call: we run the language's
-     own compiler/parser. A misplaced tag that breaks the build is caught here.
+  1. check_tag_syntax — after @ADR comment tags are placed in a source file, the
+     file must still parse. We run the language's own compiler/parser; a
+     misplaced tag that breaks the build is caught here.
 
-  2. judge_options     — LLM. "Considered Options" is the MADR section most prone
-     to hallucination (the model inventing plausible-but-unevidenced alternatives).
-     We ask a judge model whether each listed option is actually evidenced by the
-     diff / commit messages, run it N times, and take a majority vote. The judge
-     can only ever DEMOTE an unevidenced option — it never invents — so like the
-     clustering floor it cannot reduce correctness below the deterministic base.
+  2. verify_adr — "Considered Options" is the MADR section most prone to
+     hallucination (the model inventing plausible-but-unevidenced alternatives).
+     The generator must CITE each option inline (`<!-- evidence: <sha> type:detail -->`);
+     verify_adr checks every citation against git (the closed corpus makes this an
+     exact lookup, not a judgment), drops anything that doesn't hold up, and stamps
+     `evidence-verified: true` provenance. An option that cannot be pinned to the
+     bytes is dropped, never adjudicated — so verification is fully reproducible.
 
-Design mirrors analyze.py: the LLM call is injected (a `runner` callable), so the
-prompt builder, verdict parser, and N-run aggregation are all unit-testable
-without spawning Claude. Only `default_runner` actually shells out to `claude -p`.
+judge_options (LLM-as-judge, N-run majority vote) remains as an OPTIONAL manual
+tool for un-cited ADRs, but is off the verification path: an LLM verdict over
+terse evidence measures sample variance, not systematic over-inference, which is
+why citation grounding replaced it. Its model call is injected (a `runner`
+callable) so it stays unit-testable.
 
 Usage:
-    python3 scripts/judge.py check-tags <repo> <file> [<file> ...]
-    python3 scripts/judge.py judge-options <adr.md> --evidence <evidence.txt>
-                                           [--runs N] [--json]
+    python3 scripts/judge.py check-tags  <repo> <file> [<file> ...]
+    python3 scripts/judge.py verify-adr  <adr.md> --repo <repo> [--write] [--json]
+    python3 scripts/judge.py verify-options <adr.md> --repo <repo> [--json]
+    python3 scripts/judge.py judge-options  <adr.md> [--commits SHAs | --evidence f]
 """
 from __future__ import annotations
 
@@ -141,24 +145,29 @@ def evidence_for_candidate(repo: str, candidate: dict) -> str:
 #
 # The strongest guard against fabricated "Considered Options" is to make the
 # generator CITE each option inline, then check the citation against git. The
-# git history is a closed corpus, so most checks are exact lookups, not model
-# calls. A fabricated SHA fails `git cat-file`; a claimed deletion that didn't
-# happen fails the name-status check. Only genuinely fuzzy citations (a rename
-# that may or may not be an alternative, replaced code inside a modified file)
-# fall through to the LLM residue judge (judge_options).
+# git history is a closed corpus, so EVERY check is an exact lookup, not a model
+# call. A fabricated SHA fails `git cat-file`; a claimed deletion that didn't
+# happen fails the name-status check; `removed:` greps the diff for the deleted
+# line. An option that cannot be pinned to the bytes is dropped, not adjudicated
+# by an LLM — so verification is fully deterministic and reproducible.
 #
 # Citation grammar, embedded as an HTML comment after the option (invisible when
 # the markdown is rendered):
 #   * **Redis** <!-- evidence: 3f4a2bc deleted:src/cache/redis_client.py -->
 #   * RabbitMQ   <!-- evidence: a1b2c3d message:instead of rabbitmq -->
+#   * Memcached  <!-- evidence: a1b2c3d removed:"import memcache" -->
 
 CITATION_RE = re.compile(
     r"<!--\s*evidence:\s*(?P<sha>[0-9a-fA-F]{7,40})\s+"
     r"(?P<etype>[a-z-]+):(?P<detail>.+?)\s*-->",
     re.I,
 )
-# evidence types verifiable by an exact git lookup; anything else is fuzzy
-DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message"}
+# Every evidence type is verifiable by an exact git lookup — there is no LLM on
+# the verification path. `removed:` greps the cited commit's diff for a deleted
+# line, which covers "code replaced inside a modified file" deterministically.
+# Anything whose type is none of these is treated as uncheckable and dropped
+# (the safe direction: never assert an option we cannot pin to the bytes).
+DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message", "removed"}
 
 
 @dataclass
@@ -197,9 +206,11 @@ def extract_cited_options(adr_text: str) -> list[CitedOption]:
         cite_m = CITATION_RE.search(raw)
         citation = None
         if cite_m:
+            detail = cite_m.group("detail").strip()
+            if len(detail) >= 2 and detail[0] in "\"'" and detail[-1] == detail[0]:
+                detail = detail[1:-1]  # allow quoting to carry spaces/punctuation
             citation = Citation(cite_m.group("sha"),
-                                cite_m.group("etype").lower(),
-                                cite_m.group("detail").strip())
+                                cite_m.group("etype").lower(), detail)
         # strip the comment and common markdown emphasis from the visible text
         text = CITATION_RE.sub("", raw).strip().strip("*_ ").strip()
         out.append(CitedOption(option=text, citation=citation, raw=raw.strip()))
@@ -232,13 +243,21 @@ def verify_citation(repo: str, c: Citation) -> tuple[str, str]:
         return "failed", f"{c.sha} is not a commit"
 
     if c.etype not in DETERMINISTIC_TYPES:
-        return "fuzzy", f"'{c.etype}' needs semantic review"
+        return "uncheckable", f"'{c.etype}' is not a verifiable evidence type"
 
     if c.etype == "message":
         body = analyze.git(repo, "show", "-s", "--format=%B", c.sha)
         if c.detail.lower() in body.lower():
             return "verified", "phrase present in commit message"
         return "failed", "phrase not in commit message"
+
+    if c.etype == "removed":
+        diff = analyze.git(repo, "show", "--format=", "--unified=0", c.sha)
+        for line in diff.splitlines():
+            if line.startswith("-") and not line.startswith("---") \
+                    and c.detail in line[1:]:
+                return "verified", f"'{c.detail}' removed in {c.sha}"
+        return "failed", f"'{c.detail}' not among removed lines in {c.sha}"
 
     want = c.detail
     for status, paths in _name_status(repo, c.sha):
@@ -252,11 +271,10 @@ def verify_citation(repo: str, c: Citation) -> tuple[str, str]:
 
 
 def verify_options(repo: str, adr_text: str) -> dict:
-    """Tier-1 deterministic pass over an ADR's cited options.
+    """Deterministic pass over an ADR's cited options. No model calls.
 
-    overall: pass (all verified / nothing to check), fail (any failed or
-    uncited), or review (some fuzzy, none failed) -> hand fuzzy ones to the
-    LLM residue judge.
+    overall: pass (all verified / nothing to check) or fail (any option not
+    verified — failed, uncited, or uncheckable type).
     """
     cited = extract_cited_options(adr_text)
     verdicts: list[CitationVerdict] = []
@@ -268,21 +286,21 @@ def verify_options(repo: str, adr_text: str) -> dict:
         status, reason = verify_citation(repo, co.citation)
         verdicts.append(CitationVerdict(co.option, status, reason))
 
-    statuses = {v.status for v in verdicts}
-    if "failed" in statuses or "uncited" in statuses:
-        overall = "fail"
-    elif "fuzzy" in statuses:
-        overall = "review"
-    else:
-        overall = "pass"
+    overall = "pass" if all(v.status == "verified" for v in verdicts) else "fail"
     return {
         "overall": overall,
         "verdicts": [asdict(v) for v in verdicts],
-        "fuzzy": [v.option for v in verdicts if v.status == "fuzzy"],
     }
 
 
-# --- options judge (LLM, tier 2 residue) -------------------------------------
+# --- options judge (LLM) — OPTIONAL, off the default verification path --------
+#
+# Kept as a manual escape hatch (the `judge-options` CLI) for exploring an ADR
+# whose options are not citation-grounded. It is NOT called by verify_adr: the
+# deterministic citation check above is the verification path. An LLM verdict
+# over terse evidence has a known failure mode — majority vote measures sample
+# variance, not the judge's systematic over-inference — which is exactly why it
+# was demoted off the path in favor of citation grounding.
 
 OPTIONS_HEADER_RE = re.compile(r"^##\s+Considered Options\s*$", re.I | re.M)
 NEXT_HEADER_RE = re.compile(r"^##\s+", re.M)
@@ -440,25 +458,20 @@ def judge_options(
 class OptionOutcome:
     option: str
     decision: str   # kept | dropped
-    status: str     # verified | failed | uncited | fuzzy-evidenced | fuzzy-unevidenced
+    status: str     # verified | failed | uncited | uncheckable
     reason: str
     raw: str        # original list-item content (kept options re-emitted verbatim)
 
 
-def verify_adr(repo: str, adr_text: str,
-               runner: Callable[[str], str] = default_runner,
-               runs: int = 3) -> dict:
-    """Full two-tier verification of an ADR's Considered Options.
+def verify_adr(repo: str, adr_text: str) -> dict:
+    """Deterministic verification of an ADR's Considered Options. No model.
 
-    Tier 1 (deterministic): structural citation checks. Verified -> kept,
-    failed/uncited -> dropped. Tier 2 (LLM residue): only the `fuzzy` options
-    (real SHA, non-structural evidence type) go to judge_options, fed the actual
-    diff hunks of their cited commits. Returns kept/dropped outcomes + the
-    residue agreement score.
+    Each option's inline citation is checked against git. `verified` -> kept;
+    anything else (failed structural check, no citation, or an uncheckable
+    evidence type) -> dropped. Reproducible: same repo + text -> same result.
     """
     cited = extract_cited_options(adr_text)
     outcomes: list[OptionOutcome] = []
-    fuzzy: list[CitedOption] = []
 
     for co in cited:
         if co.citation is None:
@@ -466,30 +479,8 @@ def verify_adr(repo: str, adr_text: str,
                                           "no inline evidence citation", co.raw))
             continue
         status, reason = verify_citation(repo, co.citation)
-        if status == "verified":
-            outcomes.append(OptionOutcome(co.option, "kept", "verified", reason, co.raw))
-        elif status == "failed":
-            outcomes.append(OptionOutcome(co.option, "dropped", "failed", reason, co.raw))
-        else:  # fuzzy -> tier 2
-            fuzzy.append(co)
-
-    agreement = 1.0
-    if fuzzy:
-        shas = [co.citation.sha for co in fuzzy]
-        evidence = build_evidence(repo, shas, include_patch=True)
-        verdict = judge_options([co.option for co in fuzzy], evidence,
-                                runner=runner, runs=runs)
-        agreement = verdict.agreement
-        by_option = {o.option: o for o in verdict.options}
-        for co in fuzzy:
-            ov = by_option.get(co.option)
-            evidenced = ov is not None and ov.verdict == "evidenced"
-            if evidenced:
-                outcomes.append(OptionOutcome(co.option, "kept", "fuzzy-evidenced",
-                                              ov.evidence or "judged evidenced", co.raw))
-            else:
-                outcomes.append(OptionOutcome(co.option, "dropped", "fuzzy-unevidenced",
-                                              "residue judge found no support", co.raw))
+        decision = "kept" if status == "verified" else "dropped"
+        outcomes.append(OptionOutcome(co.option, decision, status, reason, co.raw))
 
     kept = [o for o in outcomes if o.decision == "kept"]
     dropped = [o for o in outcomes if o.decision == "dropped"]
@@ -497,7 +488,6 @@ def verify_adr(repo: str, adr_text: str,
         "overall": "pass" if not dropped else "rewritten",
         "kept": [asdict(o) for o in kept],
         "dropped": [asdict(o) for o in dropped],
-        "residue_agreement": agreement,
         "had_options": bool(cited),
     }
 
@@ -550,7 +540,7 @@ def render_verified_adr(adr_text: str, result: dict,
         f"  method: {method}",
         f"  generated: {date}",
         "  evidence-verified: true",
-        "  verification: citation-structural+llm-residue",
+        "  verification: citation-structural",
         f"  options-kept: {len(kept)}",
         f"  options-dropped: {len(result['dropped'])}",
     ])
@@ -598,7 +588,7 @@ def _cmd_verify_options(args) -> int:
 
 def _cmd_verify_adr(args) -> int:
     adr_text = open(args.adr).read()
-    result = verify_adr(args.repo, adr_text, runs=args.runs)
+    result = verify_adr(args.repo, adr_text)
     rendered = render_verified_adr(adr_text, result)
     if args.write:
         with open(args.adr, "w") as fh:
@@ -607,10 +597,10 @@ def _cmd_verify_adr(args) -> int:
         print(json.dumps(result, indent=2))
     else:
         print(f"overall: {result['overall']}  "
-              f"kept: {len(result['kept'])}  dropped: {len(result['dropped'])}  "
-              f"residue-agreement: {result['residue_agreement']:.2f}")
+              f"kept: {len(result['kept'])}  dropped: {len(result['dropped'])}")
         for o in result["kept"] + result["dropped"]:
-            print(f"  [{o['decision']:7}/{o['status']:18}] {o['option']}")
+            print(f"  [{o['decision']:7}/{o['status']:11}] {o['option']}"
+                  + (f"  — {o['reason']}" if o["reason"] else ""))
         if args.write:
             print(f"wrote rewritten ADR -> {args.adr}")
     return 0
@@ -662,10 +652,9 @@ def main() -> int:
     vo.set_defaults(func=_cmd_verify_options)
 
     va = sub.add_parser("verify-adr",
-                        help="full tier-1+tier-2 verify, drop unevidenced, stamp provenance")
+                        help="deterministic citation verify: drop unevidenced, stamp provenance")
     va.add_argument("adr")
     va.add_argument("--repo", default=".")
-    va.add_argument("--runs", type=int, default=3)
     va.add_argument("--write", action="store_true", help="rewrite the ADR in place")
     va.add_argument("--json", action="store_true")
     va.set_defaults(func=_cmd_verify_adr)
