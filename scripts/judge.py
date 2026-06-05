@@ -99,13 +99,15 @@ def check_tags(repo: str, paths: list[str]) -> dict:
 
 # --- evidence builder --------------------------------------------------------
 
-def build_evidence(repo: str, shas: list[str], max_files: int = 40) -> str:
+def build_evidence(repo: str, shas: list[str], max_files: int = 40,
+                   include_patch: bool = False, max_patch_lines: int = 200) -> str:
     """Render the commit evidence block the options judge reads, from SHAs.
 
     Per commit: the subject line (where "instead of X" / "migrate from Y" live)
-    plus name-status (where deletions = the replaced old approach show up). This
-    is exactly the (a)/(b) evidence the judge is told to look for; full hunks are
-    intentionally omitted to keep the prompt small and the signal dense.
+    plus name-status (where deletions = the replaced old approach show up). By
+    default hunks are omitted to keep the prompt small; `include_patch` appends
+    the (capped) diff, which the tier-2 residue judge needs to see code replaced
+    *inside* a modified file — the one signal name-status can't carry.
     """
     blocks: list[str] = []
     for sha in shas:
@@ -119,6 +121,13 @@ def build_evidence(repo: str, shas: list[str], max_files: int = 40) -> str:
                 lines.append(f"  {ns}")
         if len(name_status) > max_files:
             lines.append(f"  ... ({len(name_status) - max_files} more files)")
+        if include_patch:
+            patch = analyze.git(repo, "show", "--format=", "--unified=3",
+                                sha).splitlines()
+            lines.append("  --- diff ---")
+            lines.extend("  " + p for p in patch[:max_patch_lines])
+            if len(patch) > max_patch_lines:
+                lines.append(f"  ... ({len(patch) - max_patch_lines} more diff lines)")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks).strip()
 
@@ -163,6 +172,7 @@ class Citation:
 class CitedOption:
     option: str               # human-visible option text (comment stripped)
     citation: Optional[Citation]
+    raw: str = ""             # original list-item content, for verbatim re-emit
 
 
 @dataclass
@@ -192,7 +202,7 @@ def extract_cited_options(adr_text: str) -> list[CitedOption]:
                                 cite_m.group("detail").strip())
         # strip the comment and common markdown emphasis from the visible text
         text = CITATION_RE.sub("", raw).strip().strip("*_ ").strip()
-        out.append(CitedOption(option=text, citation=citation))
+        out.append(CitedOption(option=text, citation=citation, raw=raw.strip()))
     return out
 
 
@@ -424,6 +434,129 @@ def judge_options(
     return winner
 
 
+# --- combined pipeline (tier 1 + tier 2) + provenance render -----------------
+
+@dataclass
+class OptionOutcome:
+    option: str
+    decision: str   # kept | dropped
+    status: str     # verified | failed | uncited | fuzzy-evidenced | fuzzy-unevidenced
+    reason: str
+    raw: str        # original list-item content (kept options re-emitted verbatim)
+
+
+def verify_adr(repo: str, adr_text: str,
+               runner: Callable[[str], str] = default_runner,
+               runs: int = 3) -> dict:
+    """Full two-tier verification of an ADR's Considered Options.
+
+    Tier 1 (deterministic): structural citation checks. Verified -> kept,
+    failed/uncited -> dropped. Tier 2 (LLM residue): only the `fuzzy` options
+    (real SHA, non-structural evidence type) go to judge_options, fed the actual
+    diff hunks of their cited commits. Returns kept/dropped outcomes + the
+    residue agreement score.
+    """
+    cited = extract_cited_options(adr_text)
+    outcomes: list[OptionOutcome] = []
+    fuzzy: list[CitedOption] = []
+
+    for co in cited:
+        if co.citation is None:
+            outcomes.append(OptionOutcome(co.option, "dropped", "uncited",
+                                          "no inline evidence citation", co.raw))
+            continue
+        status, reason = verify_citation(repo, co.citation)
+        if status == "verified":
+            outcomes.append(OptionOutcome(co.option, "kept", "verified", reason, co.raw))
+        elif status == "failed":
+            outcomes.append(OptionOutcome(co.option, "dropped", "failed", reason, co.raw))
+        else:  # fuzzy -> tier 2
+            fuzzy.append(co)
+
+    agreement = 1.0
+    if fuzzy:
+        shas = [co.citation.sha for co in fuzzy]
+        evidence = build_evidence(repo, shas, include_patch=True)
+        verdict = judge_options([co.option for co in fuzzy], evidence,
+                                runner=runner, runs=runs)
+        agreement = verdict.agreement
+        by_option = {o.option: o for o in verdict.options}
+        for co in fuzzy:
+            ov = by_option.get(co.option)
+            evidenced = ov is not None and ov.verdict == "evidenced"
+            if evidenced:
+                outcomes.append(OptionOutcome(co.option, "kept", "fuzzy-evidenced",
+                                              ov.evidence or "judged evidenced", co.raw))
+            else:
+                outcomes.append(OptionOutcome(co.option, "dropped", "fuzzy-unevidenced",
+                                              "residue judge found no support", co.raw))
+
+    kept = [o for o in outcomes if o.decision == "kept"]
+    dropped = [o for o in outcomes if o.decision == "dropped"]
+    return {
+        "overall": "pass" if not dropped else "rewritten",
+        "kept": [asdict(o) for o in kept],
+        "dropped": [asdict(o) for o in dropped],
+        "residue_agreement": agreement,
+        "had_options": bool(cited),
+    }
+
+
+NO_ALT_LINE = "No alternatives recorded in commit history."
+
+
+def _replace_options_section(adr_text: str, new_body: str) -> str:
+    """Swap the body of the '## Considered Options' section, headers preserved."""
+    m = OPTIONS_HEADER_RE.search(adr_text)
+    if not m:
+        return adr_text
+    rest = adr_text[m.end():]
+    nxt = NEXT_HEADER_RE.search(rest)
+    tail = rest[nxt.start():] if nxt else ""
+    return adr_text[: m.end()] + "\n\n" + new_body.rstrip() + "\n\n" + tail
+
+
+def _upsert_frontmatter(adr_text: str, lines: list[str]) -> str:
+    """Insert verification provenance into YAML frontmatter (created if absent)."""
+    block = "\n".join(lines)
+    if adr_text.startswith("---\n"):
+        end = adr_text.find("\n---", 4)
+        if end != -1:
+            return adr_text[:end] + "\n" + block + adr_text[end:]
+    return f"---\n{block}\n---\n\n" + adr_text
+
+
+def render_verified_adr(adr_text: str, result: dict,
+                        method: str = "gen-adr/v1",
+                        date: Optional[str] = None) -> str:
+    """Produce the published ADR: drop unevidenced options, re-emit verified
+    ones verbatim (with their hidden citation comments), and stamp the
+    evidence-verified provenance into the frontmatter.
+    """
+    if not result.get("had_options"):
+        return adr_text  # 'No alternatives recorded' ADRs need no rewrite
+
+    kept = result["kept"]
+    if kept:
+        body = "\n".join(f"- {o['raw']}" for o in kept)
+    else:
+        body = NO_ALT_LINE
+    out = _replace_options_section(adr_text, body)
+
+    import datetime
+    date = date or datetime.date.today().isoformat()
+    out = _upsert_frontmatter(out, [
+        "generation:",
+        f"  method: {method}",
+        f"  generated: {date}",
+        "  evidence-verified: true",
+        "  verification: citation-structural+llm-residue",
+        f"  options-kept: {len(kept)}",
+        f"  options-dropped: {len(result['dropped'])}",
+    ])
+    return re.sub(r"\n{3,}", "\n\n", out)  # collapse blank-line artifacts
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _cmd_check_tags(args) -> int:
@@ -461,6 +594,26 @@ def _cmd_verify_options(args) -> int:
             print(f"  [{v['status']:8}] {v['option']}"
                   + (f"  — {v['reason']}" if v["reason"] else ""))
     return 0 if report["overall"] == "pass" else 1
+
+
+def _cmd_verify_adr(args) -> int:
+    adr_text = open(args.adr).read()
+    result = verify_adr(args.repo, adr_text, runs=args.runs)
+    rendered = render_verified_adr(adr_text, result)
+    if args.write:
+        with open(args.adr, "w") as fh:
+            fh.write(rendered)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"overall: {result['overall']}  "
+              f"kept: {len(result['kept'])}  dropped: {len(result['dropped'])}  "
+              f"residue-agreement: {result['residue_agreement']:.2f}")
+        for o in result["kept"] + result["dropped"]:
+            print(f"  [{o['decision']:7}/{o['status']:18}] {o['option']}")
+        if args.write:
+            print(f"wrote rewritten ADR -> {args.adr}")
+    return 0
 
 
 def _cmd_judge_options(args) -> int:
@@ -507,6 +660,15 @@ def main() -> int:
     vo.add_argument("--repo", default=".")
     vo.add_argument("--json", action="store_true")
     vo.set_defaults(func=_cmd_verify_options)
+
+    va = sub.add_parser("verify-adr",
+                        help="full tier-1+tier-2 verify, drop unevidenced, stamp provenance")
+    va.add_argument("adr")
+    va.add_argument("--repo", default=".")
+    va.add_argument("--runs", type=int, default=3)
+    va.add_argument("--write", action="store_true", help="rewrite the ADR in place")
+    va.add_argument("--json", action="store_true")
+    va.set_defaults(func=_cmd_verify_adr)
 
     jo = sub.add_parser("judge-options", help="audit Considered Options for hallucination")
     jo.add_argument("adr")

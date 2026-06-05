@@ -137,10 +137,16 @@ The biggest risk with retroactive documentation is the AI confidently making thi
 
 ### Output verification
 
-Beyond the in-generation rules above, an independent verification pass (`scripts/judge.py`) re-checks the output instead of trusting the generator to police itself:
+Beyond the in-generation rules above, a verification pass (`scripts/judge.py`) re-checks the output instead of trusting the generator to police itself.
 
-- **Considered Options audit (LLM judge).** Each generated ADR's options are re-audited by a separate model call that only sees the commit evidence and is asked, per option, "is this evidenced — yes with a pointer, or no?" Because LLM verdicts are non-deterministic, it runs **N times and takes a majority vote**, reporting an *agreement* score so a shaky verdict is visible rather than hidden. The judge can only ever *demote* an unevidenced option — it never invents one — so it cannot make an ADR worse. Any unevidenced option fails the ADR, which is then rewritten to the safe "No alternatives recorded" default.
-- **Tag syntax check (deterministic).** After `@ADR` tags are inserted, each touched file is parse-checked with the language's own compiler so a misplaced comment can't break the build. No model is involved.
+**Considered Options — citation-grounded, two tiers.** The generator must *cite* each option inline (a hidden `<!-- evidence: <sha> deleted:path -->` comment). Because the git history is a closed corpus, most verification is then an exact lookup, not a model call:
+
+- **Tier 1 (deterministic).** Confirm the cited SHA exists and that the claimed file deletion/addition/rename or commit-message phrase is really in that commit. A fabricated SHA or a change that didn't happen → the option is dropped; an uncited option → dropped. No model involved.
+- **Tier 2 (LLM residue).** Only options whose evidence is non-structural (e.g. code replaced *inside* a modified file) reach a model, which sees the actual diff hunks and votes evidenced/unevidenced over N runs. This is a small minority of options. The judge can only ever *demote* — never invent — so it cannot make an ADR worse.
+
+Surviving options are kept; the rest are dropped (collapsing to "No alternatives recorded" if none survive), and the ADR's frontmatter is stamped `evidence-verified: true`. A downstream agent reading that flag should **trust the prose and not re-investigate the cited commits** — the citations are an audit trail, not a re-check prompt.
+
+**Tag syntax check (deterministic).** After `@ADR` tags are inserted, each touched file is parse-checked with the language's own compiler so a misplaced comment can't break the build. No model is involved.
 
 ### Tag validation coverage
 
