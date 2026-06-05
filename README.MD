@@ -20,7 +20,7 @@ This skill does it automatically.
 
 1. **Reads your git history** — commit by commit, PR by PR
 2. **Detects what kind of history you have** — merge commits, squash merges, rebase/linear, or mixed
-3. **Groups commits into logical decision chunks** — not just by time, but by what subsystems they touched and what they changed
+3. **Groups commits into logical decision chunks** — not just by time, but by what subsystems they touched and what they changed — then clusters related chunks *across* PR boundaries, so one decision spread over several PRs becomes a single ADR instead of three redundant ones
 4. **Classifies which chunks represent architectural decisions** — filtering out bug fixes, lint, version bumps, and test-only changes using diff signals, not just commit messages
 5. **Generates a MADR file per decision** — with context, considered options (only what's evidenced in the diff), outcome, and links back to the original commits
 6. **Places `@ADR` inline tags** on the relevant functions and classes — so a coding agent grepping the codebase finds the decision log right at the code it affected
@@ -102,7 +102,7 @@ Any combination works. For large repos or monorepos, `module:` + `since:` is the
 - Codebase has meaningful git history with decent commit messages
 - You want to run a coding agent on legacy code without it undoing past decisions
 - Modules with clear boundaries (payments, auth, infra) that you want to document independently
-- Repos using squash-merge or merge-commit workflows (each PR = one unit of work)
+- Repos using squash-merge or merge-commit workflows (clear PR boundaries to chunk from — though a single decision may still span several PRs, which the clustering pass bundles back together)
 
 **Not a good fit:**
 - Shallow clones — the skill will stop and tell you to unshallow first
