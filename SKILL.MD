@@ -324,6 +324,26 @@ The most likely hallucination point is "Considered Options." Enforce this mental
  
 In **assisted mode**, show the draft and wait for `[write / edit / skip]` before touching disk.
  
+### Verify Considered Options (judge pass)
+ 
+After writing an ADR that lists one or more Considered Options, run the independent judge to catch hallucinated alternatives. Skip this when the ADR already says "No alternatives recorded" — there is nothing to audit.
+ 
+```bash
+# Build an evidence file for the candidate (commit subjects + name-status)
+git show --no-patch --format="commit %H %s" <sha1> <sha2> > /tmp/adr-evidence.txt
+git show --name-status --format="" <sha1> <sha2> >> /tmp/adr-evidence.txt
+ 
+# Audit the Considered Options section (majority vote over N runs)
+python3 scripts/judge.py judge-options docs/decisions/<NNNN-slug>.md \
+    --evidence /tmp/adr-evidence.txt --runs 3 --json
+```
+ 
+- **`overall: pass`** → leave the ADR as-is.
+- **`overall: fail`** → at least one listed option is not evidenced. Rewrite the Considered Options section: drop the unevidenced options, and if none remain, replace the section body with exactly `No alternatives recorded in commit history.`
+- **low `agreement`** (e.g. < 0.67) → the judge was unsure; in assisted mode surface this to the user, in autonomous mode treat a non-unanimous `fail` as fail (prefer dropping a doubtful option).
+ 
+The judge defaults to a small model and only ever *removes* options, so it cannot introduce new claims. In **assisted mode**, show the verdict before rewriting.
+ 
 ---
  
 ## Step 5: Place Inline @ADR Tags
@@ -369,6 +389,20 @@ ADR-0004 tag placements:
   src/events/queue.py:10      → class EventQueue
 Confirm? [yes / adjust / skip tagging]
 ```
+ 
+### Verify tag syntax (after placement)
+ 
+A misplaced comment can break a file. After writing tags, parse-check every file you touched:
+ 
+```bash
+python3 scripts/judge.py check-tags . <file1> <file2> ... --json
+```
+ 
+- **`ok`** → the tag parsed cleanly, keep it.
+- **`fail`** → the tag broke the file. Revert that one insertion (or move it to a safer line — e.g. above the `def`/`func` rather than inside a signature) and re-check.
+- **`skipped`** → no syntax checker for that language, or the tool isn't installed. The tag is kept un-verified; note it in the run summary.
+ 
+**Syntax-check coverage is a fixed set:** Python, JavaScript (`.js`/`.mjs`/`.cjs`), Ruby, Shell (`.sh`/`.bash`), and Go (needs `gofmt` on `PATH`). TypeScript, Java/Kotlin, and Rust get tags placed but are **not** parse-checked yet — they return `skipped`. For those, eyeball the insertion point.
  
 ---
  

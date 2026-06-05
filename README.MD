@@ -135,6 +135,30 @@ The biggest risk with retroactive documentation is the AI confidently making thi
 - **Rationale** is only drawn from commit messages and diff context. If unclear, the MADR says so explicitly rather than fabricating a reason.
 - Every generated MADR includes a header note: `"This ADR was retroactively generated from commit history. Rationale accuracy depends on commit message quality."`
 
+### Output verification
+
+Beyond the in-generation rules above, an independent verification pass (`scripts/judge.py`) re-checks the output instead of trusting the generator to police itself:
+
+- **Considered Options audit (LLM judge).** Each generated ADR's options are re-audited by a separate model call that only sees the commit evidence and is asked, per option, "is this evidenced — yes with a pointer, or no?" Because LLM verdicts are non-deterministic, it runs **N times and takes a majority vote**, reporting an *agreement* score so a shaky verdict is visible rather than hidden. The judge can only ever *demote* an unevidenced option — it never invents one — so it cannot make an ADR worse. Any unevidenced option fails the ADR, which is then rewritten to the safe "No alternatives recorded" default.
+- **Tag syntax check (deterministic).** After `@ADR` tags are inserted, each touched file is parse-checked with the language's own compiler so a misplaced comment can't break the build. No model is involved.
+
+### Tag validation coverage
+
+The deterministic syntax check supports a **fixed set** of languages. Files outside this set still get tags placed, but the syntax check **skips** them (it never false-fails):
+
+| Language | `@ADR` tags placed | Syntax-checked |
+|----------|:---:|:---:|
+| Python | ✅ | ✅ |
+| JavaScript (`.js` / `.mjs` / `.cjs`) | ✅ | ✅ |
+| Ruby | ✅ | ✅ |
+| Shell (`.sh` / `.bash`) | ✅ | ✅ |
+| Go | ✅ | ✅ *(requires `gofmt` on `PATH`)* |
+| TypeScript (`.ts` / `.tsx`) | ✅ | ❌ skipped |
+| Java / Kotlin | ✅ | ❌ skipped |
+| Rust | ✅ | ❌ skipped |
+
+If a checker's tool isn't installed on the host (e.g. `gofmt`, `node`, `ruby`), that file is also skipped rather than failed.
+
 ---
 
 ## Installation
