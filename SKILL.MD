@@ -286,11 +286,17 @@ not just what was added.>
  
 ## Considered Options
  
-<STRICT RULE: Only list options that are directly evidenced:
-  - Code being replaced/deleted in the diff (old approach)
-  - Explicit "instead of X" / "replacing Y" in commit message
-  - Branch name referencing an alternative approach
-If none evidenced: write exactly "No alternatives recorded in commit history." and leave the list empty.
+<STRICT RULE: Only list options that are directly evidenced, and CITE each one
+inline with a hidden HTML-comment so the verifier can check it against git:
+ 
+  - `* <option> <!-- evidence: <sha> deleted:<path> -->`   (old approach removed)
+  - `* <option> <!-- evidence: <sha> added:<path> -->`     (new approach added)
+  - `* <option> <!-- evidence: <sha> renamed:<path> -->`   (file moved/renamed)
+  - `* <option> <!-- evidence: <sha> message:<phrase> -->` (phrase in commit msg, e.g. "instead of redis")
+ 
+The `<sha>` MUST be one of this candidate's commits. Every option needs a citation —
+an option you cannot cite does not belong here. If none are evidenced, write exactly
+"No alternatives recorded in commit history." and leave the list empty.
 DO NOT populate this with plausible alternatives from general knowledge.>
  
 ## Decision Outcome
@@ -324,26 +330,36 @@ The most likely hallucination point is "Considered Options." Enforce this mental
  
 In **assisted mode**, show the draft and wait for `[write / edit / skip]` before touching disk.
  
-### Verify Considered Options (judge pass)
+### Verify Considered Options (two-tier judge)
  
-After writing an ADR that lists one or more Considered Options, run the independent judge to catch hallucinated alternatives. Skip this when the ADR already says "No alternatives recorded" — there is nothing to audit.
+After writing an ADR, run the verifier. It checks every option's inline citation and rewrites the section to keep only what holds up:
  
 ```bash
-# Audit the Considered Options section (majority vote over N runs).
-# --commits builds the evidence block (subjects + name-status) from the
-# candidate's SHAs automatically — the same SHAs analyze.py grouped.
-python3 scripts/judge.py judge-options docs/decisions/<NNNN-slug>.md \
-    --repo . --commits "<sha1>,<sha2>" --runs 3 --json
+python3 scripts/judge.py verify-adr docs/decisions/<NNNN-slug>.md \
+    --repo . --runs 3 --write --json
 ```
  
-> The evidence block can be inspected on its own with
-> `python3 scripts/judge.py evidence . --commits "<sha1>,<sha2>"`.
+Two tiers run automatically:
  
-- **`overall: pass`** → leave the ADR as-is.
-- **`overall: fail`** → at least one listed option is not evidenced. Rewrite the Considered Options section: drop the unevidenced options, and if none remain, replace the section body with exactly `No alternatives recorded in commit history.`
-- **low `agreement`** (e.g. < 0.67) → the judge was unsure; in assisted mode surface this to the user, in autonomous mode treat a non-unanimous `fail` as fail (prefer dropping a doubtful option).
+1. **Tier 1 — deterministic git check (no model).** For each citation: confirm the SHA exists, then confirm the claimed `deleted`/`added`/`renamed` file or `message:` phrase is really in that commit. A fabricated SHA or a claimed change that didn't happen → the option is **dropped**. An option with **no citation** → dropped.
+2. **Tier 2 — LLM residue.** Only options whose evidence type is non-structural (e.g. code replaced *inside* a modified file) reach the model, which sees the actual diff hunks of the cited commit and votes evidenced/unevidenced over N runs. This is a small minority of options, so the judge's known bias on terse metadata barely applies.
  
-The judge defaults to a small model and only ever *removes* options, so it cannot introduce new claims. In **assisted mode**, show the verdict before rewriting.
+With `--write`, the verifier itself rewrites the section (dropping unevidenced options, collapsing to "No alternatives recorded" if none survive) and stamps the frontmatter (see below). Inspect first without `--write` to preview. In **assisted mode**, run without `--write`, show the kept/dropped table, then apply.
+ 
+### Provenance and the downstream trust boundary
+ 
+`verify-adr --write` stamps the ADR's YAML frontmatter:
+ 
+```yaml
+generation:
+  method: gen-adr/v1
+  evidence-verified: true
+  verification: citation-structural+llm-residue
+  options-kept: 2
+  options-dropped: 1
+```
+ 
+The per-option `<!-- evidence: ... -->` comments are kept (invisible when rendered) as an audit trail. **This is a trust boundary, not an invitation to re-check.** A downstream coding agent reading an ADR with `evidence-verified: true` should **trust the Considered Options prose as already cross-checked against git, and must NOT re-investigate the cited commits.** The citations exist for a human auditor or a re-run of `verify-adr`, not for the consuming agent to chase. Treat the listed options as the verified historical decision space.
  
 ---
  
