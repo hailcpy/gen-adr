@@ -38,6 +38,8 @@ from collections import Counter
 from dataclasses import dataclass, asdict, field
 from typing import Callable, Optional
 
+import analyze  # reuse git() + the parsed pipeline so the two scripts compose
+
 # --- syntax-safety check (deterministic) -------------------------------------
 
 # file extension -> argv template that returns non-zero on a parse error.
@@ -93,6 +95,37 @@ def check_tags(repo: str, paths: list[str]) -> dict:
         "failed": len(failed),
         "results": [asdict(r) for r in results],
     }
+
+
+# --- evidence builder --------------------------------------------------------
+
+def build_evidence(repo: str, shas: list[str], max_files: int = 40) -> str:
+    """Render the commit evidence block the options judge reads, from SHAs.
+
+    Per commit: the subject line (where "instead of X" / "migrate from Y" live)
+    plus name-status (where deletions = the replaced old approach show up). This
+    is exactly the (a)/(b) evidence the judge is told to look for; full hunks are
+    intentionally omitted to keep the prompt small and the signal dense.
+    """
+    blocks: list[str] = []
+    for sha in shas:
+        subject = analyze.git(repo, "show", "--no-patch", "--format=%H %s",
+                              sha).strip()
+        name_status = analyze.git(repo, "show", "--name-status", "--format=",
+                                  sha).strip().splitlines()
+        lines = [f"commit {subject}"]
+        for ns in name_status[:max_files]:
+            if ns.strip():
+                lines.append(f"  {ns}")
+        if len(name_status) > max_files:
+            lines.append(f"  ... ({len(name_status) - max_files} more files)")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks).strip()
+
+
+def evidence_for_candidate(repo: str, candidate: dict) -> str:
+    """Evidence for one analyze.py candidate dict (uses its `commits` SHAs)."""
+    return build_evidence(repo, candidate.get("commits", []))
 
 
 # --- options judge (LLM) -----------------------------------------------------
@@ -262,10 +295,26 @@ def _cmd_check_tags(args) -> int:
     return 0 if report["ok"] else 1
 
 
+def _split_shas(spec: Optional[str]) -> list[str]:
+    if not spec:
+        return []
+    return [s for s in re.split(r"[,\s]+", spec.strip()) if s]
+
+
+def _cmd_evidence(args) -> int:
+    print(build_evidence(args.repo, _split_shas(args.commits)))
+    return 0
+
+
 def _cmd_judge_options(args) -> int:
     adr_text = open(args.adr).read()
     options = extract_options(adr_text)
-    evidence = open(args.evidence).read() if args.evidence else ""
+    if args.commits:
+        evidence = build_evidence(args.repo, _split_shas(args.commits))
+    elif args.evidence:
+        evidence = open(args.evidence).read()
+    else:
+        evidence = ""
     verdict = judge_options(options, evidence, runs=args.runs)
     out = asdict(verdict)
     out.pop("raw_runs", None)
@@ -290,9 +339,18 @@ def main() -> int:
     ct.add_argument("--json", action="store_true")
     ct.set_defaults(func=_cmd_check_tags)
 
+    ev = sub.add_parser("evidence", help="build a judge evidence block from commit SHAs")
+    ev.add_argument("repo")
+    ev.add_argument("--commits", required=True, help="comma/space-separated SHAs")
+    ev.set_defaults(func=_cmd_evidence)
+
     jo = sub.add_parser("judge-options", help="audit Considered Options for hallucination")
     jo.add_argument("adr")
-    jo.add_argument("--evidence", default=None, help="path to commit-evidence text")
+    jo.add_argument("--repo", default=".", help="repo for --commits evidence")
+    jo.add_argument("--commits", default=None,
+                    help="comma/space-separated SHAs; builds evidence automatically")
+    jo.add_argument("--evidence", default=None,
+                    help="path to a pre-built evidence text file (ignored if --commits given)")
     jo.add_argument("--runs", type=int, default=3)
     jo.add_argument("--json", action="store_true")
     jo.set_defaults(func=_cmd_judge_options)

@@ -329,14 +329,15 @@ In **assisted mode**, show the draft and wait for `[write / edit / skip]` before
 After writing an ADR that lists one or more Considered Options, run the independent judge to catch hallucinated alternatives. Skip this when the ADR already says "No alternatives recorded" — there is nothing to audit.
  
 ```bash
-# Build an evidence file for the candidate (commit subjects + name-status)
-git show --no-patch --format="commit %H %s" <sha1> <sha2> > /tmp/adr-evidence.txt
-git show --name-status --format="" <sha1> <sha2> >> /tmp/adr-evidence.txt
- 
-# Audit the Considered Options section (majority vote over N runs)
+# Audit the Considered Options section (majority vote over N runs).
+# --commits builds the evidence block (subjects + name-status) from the
+# candidate's SHAs automatically — the same SHAs analyze.py grouped.
 python3 scripts/judge.py judge-options docs/decisions/<NNNN-slug>.md \
-    --evidence /tmp/adr-evidence.txt --runs 3 --json
+    --repo . --commits "<sha1>,<sha2>" --runs 3 --json
 ```
+ 
+> The evidence block can be inspected on its own with
+> `python3 scripts/judge.py evidence . --commits "<sha1>,<sha2>"`.
  
 - **`overall: pass`** → leave the ADR as-is.
 - **`overall: fail`** → at least one listed option is not evidenced. Rewrite the Considered Options section: drop the unevidenced options, and if none remain, replace the section body with exactly `No alternatives recorded in commit history.`
