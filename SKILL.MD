@@ -289,15 +289,20 @@ not just what was added.>
 <STRICT RULE: Only list options that are directly evidenced, and CITE each one
 inline with a hidden HTML-comment so the verifier can check it against git:
  
-  - `* <option> <!-- evidence: <sha> deleted:<path> -->`   (old approach removed)
-  - `* <option> <!-- evidence: <sha> added:<path> -->`     (new approach added)
-  - `* <option> <!-- evidence: <sha> renamed:<path> -->`   (file moved/renamed)
-  - `* <option> <!-- evidence: <sha> message:<phrase> -->` (phrase in commit msg, e.g. "instead of redis")
+  - `* <option> <!-- evidence: <sha> deleted:<path> -->`     (whole file for the old approach removed)
+  - `* <option> <!-- evidence: <sha> added:<path> -->`       (new approach added)
+  - `* <option> <!-- evidence: <sha> renamed:<path> -->`     (file moved/renamed)
+  - `* <option> <!-- evidence: <sha> removed:"<line>" -->`   (a specific deleted line — for code replaced *inside* a modified file)
+  - `* <option> <!-- evidence: <sha> message:<phrase> -->`   (phrase in commit msg, e.g. "instead of redis")
  
-The `<sha>` MUST be one of this candidate's commits. Every option needs a citation —
-an option you cannot cite does not belong here. If none are evidenced, write exactly
-"No alternatives recorded in commit history." and leave the list empty.
-DO NOT populate this with plausible alternatives from general knowledge.>
+The `<sha>` MUST be one of this candidate's commits, and the cited change must be
+real — the verifier checks each citation against git and DROPS any option whose
+citation does not hold up. Prefer `removed:"<exact deleted line>"` over a vague
+claim: if an alternative is only evidenced by code changed inside a file, cite the
+actual line that was deleted. Every option needs a citation — an option you cannot
+pin to a specific commit and change does not belong here. If none are evidenced,
+write exactly "No alternatives recorded in commit history." and leave the list
+empty. DO NOT populate this with plausible alternatives from general knowledge.>
  
 ## Decision Outcome
  
@@ -330,21 +335,20 @@ The most likely hallucination point is "Considered Options." Enforce this mental
  
 In **assisted mode**, show the draft and wait for `[write / edit / skip]` before touching disk.
  
-### Verify Considered Options (two-tier judge)
+### Verify Considered Options (deterministic citation check)
  
-After writing an ADR, run the verifier. It checks every option's inline citation and rewrites the section to keep only what holds up:
+After writing an ADR, run the verifier. It checks every option's inline citation against git and rewrites the section to keep only what holds up. **No model is involved — same repo + text always yields the same result:**
  
 ```bash
 python3 scripts/judge.py verify-adr docs/decisions/<NNNN-slug>.md \
-    --repo . --runs 3 --write --json
+    --repo . --write --json
 ```
  
-Two tiers run automatically:
+For each option's citation it confirms the SHA exists, then confirms the claimed change is real: `deleted`/`added`/`renamed` against name-status, `removed:"line"` by grepping the commit's diff for that deleted line, `message:` by searching the commit message. An option is **dropped** if its citation fails, if its evidence type is not one of these (uncheckable), or if it has **no citation at all**. Because the git history is a closed corpus, every check is an exact lookup — a fabricated SHA fails `git cat-file` immediately.
  
-1. **Tier 1 — deterministic git check (no model).** For each citation: confirm the SHA exists, then confirm the claimed `deleted`/`added`/`renamed` file or `message:` phrase is really in that commit. A fabricated SHA or a claimed change that didn't happen → the option is **dropped**. An option with **no citation** → dropped.
-2. **Tier 2 — LLM residue.** Only options whose evidence type is non-structural (e.g. code replaced *inside* a modified file) reach the model, which sees the actual diff hunks of the cited commit and votes evidenced/unevidenced over N runs. This is a small minority of options, so the judge's known bias on terse metadata barely applies.
+With `--write`, the verifier rewrites the section (dropping unevidenced options, collapsing to "No alternatives recorded" if none survive) and stamps the frontmatter (see below). Run without `--write` to preview the kept/dropped table first; in **assisted mode**, preview, then apply.
  
-With `--write`, the verifier itself rewrites the section (dropping unevidenced options, collapsing to "No alternatives recorded" if none survive) and stamps the frontmatter (see below). Inspect first without `--write` to preview. In **assisted mode**, run without `--write`, show the kept/dropped table, then apply.
+> An option that can only be argued semantically — not pinned to a specific commit and change — is dropped, not adjudicated by an LLM. For a retroactive ADR that is the correct call: if you cannot point at the bytes, it should not be asserted as a considered option.
  
 ### Provenance and the downstream trust boundary
  
@@ -354,7 +358,7 @@ With `--write`, the verifier itself rewrites the section (dropping unevidenced o
 generation:
   method: gen-adr/v1
   evidence-verified: true
-  verification: citation-structural+llm-residue
+  verification: citation-structural
   options-kept: 2
   options-dropped: 1
 ```

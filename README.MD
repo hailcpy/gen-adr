@@ -139,10 +139,10 @@ The biggest risk with retroactive documentation is the AI confidently making thi
 
 Beyond the in-generation rules above, a verification pass (`scripts/judge.py`) re-checks the output instead of trusting the generator to police itself.
 
-**Considered Options — citation-grounded, two tiers.** The generator must *cite* each option inline (a hidden `<!-- evidence: <sha> deleted:path -->` comment). Because the git history is a closed corpus, most verification is then an exact lookup, not a model call:
+**Considered Options — citation-grounded and fully deterministic.** The generator must *cite* each option inline (a hidden `<!-- evidence: <sha> deleted:path -->` comment). Because the git history is a closed corpus, every check is an exact lookup, not a model call:
 
-- **Tier 1 (deterministic).** Confirm the cited SHA exists and that the claimed file deletion/addition/rename or commit-message phrase is really in that commit. A fabricated SHA or a change that didn't happen → the option is dropped; an uncited option → dropped. No model involved.
-- **Tier 2 (LLM residue).** Only options whose evidence is non-structural (e.g. code replaced *inside* a modified file) reach a model, which sees the actual diff hunks and votes evidenced/unevidenced over N runs. This is a small minority of options. The judge can only ever *demote* — never invent — so it cannot make an ADR worse.
+- Confirm the cited SHA exists, then confirm the claimed change is real: file `deleted`/`added`/`renamed` (name-status), `removed:"line"` (grep the commit's diff for that deleted line — this covers code replaced *inside* a modified file), or a `message:` phrase. A fabricated SHA or a change that didn't happen → the option is dropped. An uncited option, or one citing an evidence type that can't be checked → dropped.
+- There is **no LLM on the verification path**. An option that can only be argued semantically is dropped, not adjudicated — for a retroactive ADR, if you can't point at the bytes, it shouldn't be asserted. (This replaced an earlier LLM-judge design: a model verdict over terse commit metadata measures sample *variance*, not the judge's *systematic* over-inference, so citation grounding is both stronger and reproducible.)
 
 Surviving options are kept; the rest are dropped (collapsing to "No alternatives recorded" if none survive), and the ADR's frontmatter is stamped `evidence-verified: true`. A downstream agent reading that flag should **trust the prose and not re-investigate the cited commits** — the citations are an audit trail, not a re-check prompt.
 

@@ -257,13 +257,38 @@ def test_verify_uncited_option_fails():
     assert report["verdicts"][0]["status"] == "uncited"
 
 
-def test_verify_unknown_type_is_fuzzy():
+def test_verify_unknown_type_is_uncheckable():
     r, sha, _, _ = _first_commit_with_added_file("repo_squash")
-    adr = _adr_with_option("opt", f"<!-- evidence: {sha} replaced:src/x.py -->")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} vibes:src/x.py -->")
     report = judge.verify_options(r, adr)
-    assert report["overall"] == "review"
-    assert report["verdicts"][0]["status"] == "fuzzy"
-    assert report["fuzzy"] == ["opt"]
+    assert report["overall"] == "fail"
+    assert report["verdicts"][0]["status"] == "uncheckable"
+
+
+def _commit_with_removed_line(repo_name):
+    """(repo, sha, token) for a fixture commit that deletes a line, or None."""
+    r = repo(repo_name)
+    for cand in analyze.analyze(r)["candidates"]:
+        for sha in cand["commits"]:
+            diff = analyze.git(r, "show", "--format=", "--unified=0", sha).splitlines()
+            for line in diff:
+                if line.startswith("-") and not line.startswith("---"):
+                    token = next((w for w in line[1:].split() if len(w) > 3), None)
+                    if token:
+                        return r, sha, token
+    return None
+
+
+def test_verify_removed_line_is_deterministic():
+    found = _commit_with_removed_line("repo_squash")
+    if found is None:
+        import pytest
+        pytest.skip("no removed-line commit in fixture")
+    r, sha, token = found
+    ok = _adr_with_option("old approach", f"<!-- evidence: {sha} removed:{token} -->")
+    assert judge.verify_options(r, ok)["verdicts"][0]["status"] == "verified"
+    bad = _adr_with_option("x", f"<!-- evidence: {sha} removed:zzz_not_present_zzz -->")
+    assert judge.verify_options(r, bad)["verdicts"][0]["status"] == "failed"
 
 
 def test_verify_no_options_passes():
@@ -272,47 +297,30 @@ def test_verify_no_options_passes():
     assert judge.verify_options(repo("repo_squash"), adr)["overall"] == "pass"
 
 
-# --- combined pipeline (tier 1 + tier 2) + provenance render -----------------
+# --- combined pipeline (deterministic) + provenance render -------------------
 
-def _residue_runner(verdict_for):
-    """Stub residue judge: marks each option per the verdict_for mapping."""
-    def run(_prompt):
-        opts = [{"option": o, "verdict": v} for o, v in verdict_for.items()]
-        overall = "fail" if any(v == "unevidenced" for v in verdict_for.values()) else "pass"
-        return json.dumps({"options": opts, "overall": overall})
-    return run
-
-
-def test_verify_adr_keeps_verified_drops_failed_and_uncited():
+def test_verify_adr_keeps_verified_drops_rest():
     r, sha, path, _ = _first_commit_with_added_file("repo_squash")
     adr = (
         "# D\n\n## Considered Options\n\n"
         f"- good <!-- evidence: {sha} added:{path} -->\n"
         f"- bad <!-- evidence: {sha} added:nope.py -->\n"
+        f"- vibes <!-- evidence: {sha} replaced:{path} -->\n"
         "- naked\n\n"
         "## Decision Outcome\n\nx\n"
     )
-    result = judge.verify_adr(r, adr, runner=_residue_runner({}), runs=1)
+    result = judge.verify_adr(r, adr)
     kept = {o["option"] for o in result["kept"]}
     dropped = {o["option"]: o["status"] for o in result["dropped"]}
     assert kept == {"good"}
-    assert dropped == {"bad": "failed", "naked": "uncited"}
+    assert dropped == {"bad": "failed", "vibes": "uncheckable", "naked": "uncited"}
     assert result["overall"] == "rewritten"
 
 
-def test_verify_adr_routes_fuzzy_to_residue():
+def test_verify_adr_is_reproducible():
     r, sha, path, _ = _first_commit_with_added_file("repo_squash")
-    adr = (
-        "# D\n\n## Considered Options\n\n"
-        f"- kafka <!-- evidence: {sha} replaced:{path} -->\n"
-        f"- rabbit <!-- evidence: {sha} replaced:{path} -->\n\n"
-        "## Decision Outcome\n\nx\n"
-    )
-    runner = _residue_runner({"kafka": "evidenced", "rabbit": "unevidenced"})
-    result = judge.verify_adr(r, adr, runner=runner, runs=1)
-    assert {o["option"] for o in result["kept"]} == {"kafka"}
-    assert {o["option"] for o in result["dropped"]} == {"rabbit"}
-    assert result["kept"][0]["status"] == "fuzzy-evidenced"
+    adr = _adr_with_option("good", f"<!-- evidence: {sha} added:{path} -->")
+    assert judge.verify_adr(r, adr) == judge.verify_adr(r, adr)
 
 
 def test_render_stamps_frontmatter_and_drops_options():
@@ -323,10 +331,11 @@ def test_render_stamps_frontmatter_and_drops_options():
         f"- bad <!-- evidence: {sha} added:nope.py -->\n\n"
         "## Decision Outcome\n\nx\n"
     )
-    result = judge.verify_adr(r, adr, runner=_residue_runner({}), runs=1)
+    result = judge.verify_adr(r, adr)
     out = judge.render_verified_adr(adr, result, date="2026-06-06")
     assert out.startswith("---\n")
     assert "evidence-verified: true" in out
+    assert "verification: citation-structural" in out
     assert "options-kept: 1" in out and "options-dropped: 1" in out
     # verified option re-emitted verbatim (citation comment preserved)
     assert f"added:{path}" in out
@@ -341,7 +350,7 @@ def test_render_all_dropped_becomes_no_alternatives():
         f"- bad <!-- evidence: {sha} added:nope.py -->\n\n"
         "## Decision Outcome\n\nx\n"
     )
-    result = judge.verify_adr(r, adr, runner=_residue_runner({}), runs=1)
+    result = judge.verify_adr(r, adr)
     out = judge.render_verified_adr(adr, result)
     assert judge.NO_ALT_LINE in out
 
@@ -354,7 +363,7 @@ def test_render_upserts_into_existing_frontmatter():
         f"- good <!-- evidence: {sha} added:{path} -->\n\n"
         "## Decision Outcome\n\nx\n"
     )
-    result = judge.verify_adr(r, adr, runner=_residue_runner({}), runs=1)
+    result = judge.verify_adr(r, adr)
     out = judge.render_verified_adr(adr, result)
     assert out.count("---") == 2          # still a single frontmatter block
     assert "status: accepted" in out      # existing keys preserved
@@ -364,7 +373,7 @@ def test_render_upserts_into_existing_frontmatter():
 def test_no_options_adr_unchanged():
     adr = ("# D\n\n## Considered Options\n\n" + judge.NO_ALT_LINE
            + "\n\n## Decision Outcome\n\nx\n")
-    result = judge.verify_adr(repo("repo_squash"), adr, runner=_residue_runner({}), runs=1)
+    result = judge.verify_adr(repo("repo_squash"), adr)
     assert result["overall"] == "pass"
     assert judge.render_verified_adr(adr, result) == adr
 
