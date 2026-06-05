@@ -5,3 +5,11 @@
 .idea/
 .vscode/
 *.swp
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Generated test fixtures (built by tests/fixtures/make_fixtures.sh)
+tests/fixtures/synthetic/

@@ -1,0 +1,41 @@
+{
+  "_doc": "Ground-truth answer key for synthetic fixtures. Markers are matched as substrings against a candidate's commit subjects. PR-style markers use the parenthesized form '(#NN)' to avoid '#1' matching '#12'.",
+
+  "repo_squash": {
+    "strategy": "squash-boundary",
+    "clusters": [
+      ["(#12)", "(#18)", "(#25)"]
+    ],
+    "architectural_markers": ["(#5)", "(#12)", "(#30)"],
+    "skip_markers": ["(#1)", "(#13)", "(#14)", "(#15)"]
+  },
+
+  "repo_linear": {
+    "strategy": "direct-commit",
+    "clusters": [
+      ["adopt redis", "redis store as cache backend"]
+    ],
+    "architectural_markers": ["adopt redis"],
+    "skip_markers": ["docs: add notes"]
+  },
+
+  "repo_crossmod": {
+    "strategy": "squash-boundary",
+    "known_limitation": {
+      "should_cluster": ["(#10)", "(#20)"],
+      "note": "Cross-module grpc adoption shares no files, only the 'grpc' concept. Deterministic clustering cannot merge these; this is the documented v2-embeddings case. Test asserts the CURRENT (split) behavior so a future semantic clusterer flips it deliberately."
+    }
+  },
+
+  "repo_modules": {
+    "module_scope": {
+      "src/payments": "src/payments/docs/decisions",
+      "src/auth": "src/auth/docs/decisions"
+    },
+    "repo_scope_output": "docs/decisions"
+  },
+
+  "repo_shallow": {
+    "halt": "shallow_clone"
+  }
+}
