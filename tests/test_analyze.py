@@ -147,6 +147,98 @@ def test_module_scope_isolates_commits():
     assert candidate_with(cands, "(#2)") is None           # jose/auth excluded
 
 
+# --- co-change coupling unit tests -------------------------------------------
+
+def test_build_coupling_jaccard_math():
+    """Jaccard formula: shared / (a + b - shared)."""
+    # Manually construct the same structure build_coupling would produce.
+    # File A: 10 revisions, File B: 8 revisions, shared: 6
+    # Jaccard = 6 / (10 + 8 - 6) = 6/12 = 0.5
+    file_revs = {"a.py": 10, "b.py": 8}
+    pair_revs = {frozenset({"a.py", "b.py"}): 6}
+
+    coupling = {}
+    for pair, shared in pair_revs.items():
+        if shared < analyze.COUPLING_MIN_SHARED:
+            continue
+        fa, fb = tuple(pair)
+        denom = file_revs[fa] + file_revs[fb] - shared
+        score = shared / denom if denom else 0.0
+        if score >= analyze.COUPLING_MIN_SCORE:
+            coupling[pair] = score
+
+    assert frozenset({"a.py", "b.py"}) in coupling
+    assert abs(coupling[frozenset({"a.py", "b.py"})] - 0.5) < 1e-9
+
+
+def test_build_coupling_min_shared_gate():
+    """Pairs with fewer than COUPLING_MIN_SHARED co-appearances are excluded."""
+    file_revs = {"x.py": 10, "y.py": 10}
+    pair_revs = {frozenset({"x.py", "y.py"}): analyze.COUPLING_MIN_SHARED - 1}
+
+    coupling = {}
+    for pair, shared in pair_revs.items():
+        if shared < analyze.COUPLING_MIN_SHARED:
+            continue
+        fa, fb = tuple(pair)
+        denom = file_revs[fa] + file_revs[fb] - shared
+        score = shared / denom if denom else 0.0
+        if score >= analyze.COUPLING_MIN_SCORE:
+            coupling[pair] = score
+
+    assert len(coupling) == 0
+
+
+def test_shares_coupling_substitutes_for_topic():
+    """file_overlap + coupling should merge even without topic-token overlap."""
+    # coupling keys use full repo-relative paths, same as git log --name-status
+    coupling = {frozenset({"services/cache/cache.py", "services/cache/cache_config.yaml"}): 0.75}
+    assert analyze._shares(
+        {"services/cache"}, {"services/cache"},        # dir overlap
+        {"redis"}, {"memcached"},                      # NO topic overlap
+        {"services/cache/cache.py"}, {"services/cache/cache_config.yaml"},
+        coupling=coupling,
+    )
+
+
+def test_shares_coupling_substitutes_for_file_overlap():
+    """topic_overlap + coupling should merge even without shared files/dirs."""
+    coupling = {frozenset({"src/auth.py", "src/session.py"}): 0.60}
+    assert analyze._shares(
+        {"src/auth"}, {"src/session"},                 # NO dir overlap (different deep dirs)
+        {"auth", "token"},  {"auth", "session"},       # topic overlap: "auth"
+        {"src/auth.py"}, {"src/session.py"},
+        coupling=coupling,
+    )
+
+
+def test_shares_coupling_alone_does_not_merge():
+    """Coupling alone (without any other signal) must NOT trigger a merge."""
+    coupling = {frozenset({"a.py", "b.py"}): 0.90}
+    assert not analyze._shares(
+        {"module/a"}, {"module/b"},                    # different deep dirs
+        {"alpha"},    {"beta"},                        # no topic overlap
+        {"a.py"},     {"b.py"},
+        coupling=coupling,
+    )
+
+
+def test_shares_no_coupling_unchanged():
+    """Without coupling, original AND-gate behaviour is preserved."""
+    # file overlap + topic overlap → merge
+    assert analyze._shares(
+        {"src"}, {"src"}, {"redis"}, {"redis"},
+        {"src/cache.py"}, {"src/cache.py"},
+        coupling=None,
+    )
+    # file overlap only → no merge
+    assert not analyze._shares(
+        {"src"}, {"src"}, {"foo"}, {"bar"},
+        {"src/cache.py"}, {"src/cache.py"},
+        coupling=None,
+    )
+
+
 # --- documented limitation (xfail) -------------------------------------------
 
 import pytest
