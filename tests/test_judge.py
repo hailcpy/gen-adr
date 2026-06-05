@@ -186,6 +186,92 @@ def test_evidence_composes_with_judge(monkeypatch):
     assert cand["subjects"][0] in captured["prompt"]
 
 
+# --- citation verification (deterministic, against real fixtures) ------------
+
+def _first_commit_with_added_file(repo_name):
+    """Return (repo, sha, added_path, subject) for a fixture commit that adds a file."""
+    r = repo(repo_name)
+    for cand in analyze.analyze(r)["candidates"]:
+        for sha in cand["commits"]:
+            for status, paths in judge._name_status(r, sha):
+                if status == "A" and paths:
+                    return r, sha, paths[0], cand["subjects"][0]
+    raise AssertionError(f"no added-file commit in {repo_name}")
+
+
+def _adr_with_option(option_text, comment):
+    return (f"# Decision\n\n## Considered Options\n\n"
+            f"- {option_text} {comment}\n\n## Decision Outcome\n\nChosen.\n")
+
+
+def test_extract_cited_option_parses_citation():
+    adr = _adr_with_option("Redis", "<!-- evidence: 3f4a2bc deleted:src/x.py -->")
+    cited = judge.extract_cited_options(adr)
+    assert len(cited) == 1
+    assert cited[0].option == "Redis"
+    assert cited[0].citation.sha == "3f4a2bc"
+    assert cited[0].citation.etype == "deleted"
+    assert cited[0].citation.detail == "src/x.py"
+
+
+def test_extract_cited_option_no_citation():
+    cited = judge.extract_cited_options(_adr_with_option("Redis", ""))
+    assert cited[0].citation is None
+
+
+def test_verify_added_file_citation_passes():
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    report = judge.verify_options(r, adr)
+    assert report["overall"] == "pass"
+    assert report["verdicts"][0]["status"] == "verified"
+
+
+def test_verify_wrong_path_fails():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:does/not/exist.py -->")
+    report = judge.verify_options(r, adr)
+    assert report["overall"] == "fail"
+    assert report["verdicts"][0]["status"] == "failed"
+
+
+def test_verify_fabricated_sha_fails():
+    r = repo("repo_squash")
+    adr = _adr_with_option("opt", "<!-- evidence: 0000000 added:foo.py -->")
+    report = judge.verify_options(r, adr)
+    assert report["verdicts"][0]["status"] == "failed"
+    assert "not found" in report["verdicts"][0]["reason"]
+
+
+def test_verify_message_phrase():
+    r, sha, _, subject = _first_commit_with_added_file("repo_squash")
+    word = next(w for w in subject.split() if len(w) > 4)
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} message:{word} -->")
+    report = judge.verify_options(r, adr)
+    assert report["verdicts"][0]["status"] == "verified"
+
+
+def test_verify_uncited_option_fails():
+    report = judge.verify_options(repo("repo_squash"), _adr_with_option("Redis", ""))
+    assert report["overall"] == "fail"
+    assert report["verdicts"][0]["status"] == "uncited"
+
+
+def test_verify_unknown_type_is_fuzzy():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} replaced:src/x.py -->")
+    report = judge.verify_options(r, adr)
+    assert report["overall"] == "review"
+    assert report["verdicts"][0]["status"] == "fuzzy"
+    assert report["fuzzy"] == ["opt"]
+
+
+def test_verify_no_options_passes():
+    adr = ("# D\n\n## Considered Options\n\n"
+           "No alternatives recorded in commit history.\n\n## Outcome\n\nx\n")
+    assert judge.verify_options(repo("repo_squash"), adr)["overall"] == "pass"
+
+
 # --- N-run aggregation -------------------------------------------------------
 
 def _runner_returning(*responses):
