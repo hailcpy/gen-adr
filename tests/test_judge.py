@@ -11,11 +11,15 @@ import shutil
 
 import pytest
 
+import analyze
 import judge
+from conftest import repo
 from judge import (
     JudgeVerdict,
+    build_evidence,
     build_options_judge_prompt,
     check_tag_syntax,
+    evidence_for_candidate,
     extract_options,
     judge_options,
     parse_verdict,
@@ -144,6 +148,42 @@ def test_parse_infers_overall_when_missing():
     raw = json.dumps({"options": [{"option": "X", "verdict": "unevidenced"}]})
     v = parse_verdict(raw)
     assert v.overall == "fail"  # inferred from the unevidenced option
+
+
+# --- evidence builder (against real fixture repos) ---------------------------
+
+def test_build_evidence_has_subject_and_status():
+    """Evidence for a real candidate carries the subject line and a name-status."""
+    r = repo("repo_squash")
+    cands = analyze.analyze(r)["candidates"]
+    cand = next(c for c in cands if c["commits"])
+    ev = evidence_for_candidate(r, cand)
+    assert ev.startswith("commit ")
+    # the candidate's first subject must appear in the evidence text
+    assert cand["subjects"][0] in ev
+    # at least one name-status row (A/M/D/R + tab + path)
+    assert any(line.strip()[:1] in "AMDR" and "\t" in line
+               for line in ev.splitlines())
+
+
+def test_build_evidence_empty_shas():
+    assert build_evidence(repo("repo_squash"), []) == ""
+
+
+def test_evidence_composes_with_judge(monkeypatch):
+    """End-to-end wiring: candidate -> evidence -> prompt, no model call."""
+    r = repo("repo_squash")
+    cand = next(c for c in analyze.analyze(r)["candidates"] if c["commits"])
+    ev = evidence_for_candidate(r, cand)
+    captured = {}
+
+    def fake_runner(prompt):
+        captured["prompt"] = prompt
+        return '{"options": [{"option": "X", "verdict": "evidenced"}], "overall": "pass"}'
+
+    judge_options(["X"], ev, runner=fake_runner, runs=1)
+    # the built evidence actually reached the judge prompt
+    assert cand["subjects"][0] in captured["prompt"]
 
 
 # --- N-run aggregation -------------------------------------------------------
