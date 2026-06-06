@@ -40,6 +40,10 @@ except ImportError:
 COUPLING_MIN_SHARED = 5   # Tornhill's empirical minimums from code-maat
 COUPLING_MIN_SCORE  = 0.30
 
+# auto-tuned edge specificity (see Config.auto_specificity)
+AUTO_SPEC_MIN_COMMITS = 50   # below this, hotness isn't meaningful → no-op
+AUTO_SPEC_DIVISOR     = 50   # cap = max(3, commit_count // divisor)
+
 DEP_FILES = {
     "package.json", "requirements.txt", "go.mod", "cargo.toml",
     "pom.xml", "build.gradle", "pipfile", "pyproject.toml", "gemfile",
@@ -117,6 +121,13 @@ class Config:
     file_df_max: Optional[int] = None
     token_df_max: Optional[int] = None
     dir_df_max: Optional[int] = None
+    # When no cap is set explicitly, derive all three from commit count for
+    # repos large enough that 'hot' files are meaningful (a deterministic
+    # function of history size, so output stays reproducible). This gives a
+    # sane out-of-box result instead of one mega-cluster. Set any cap, or
+    # auto_specificity=False, to opt out. Below AUTO_SPEC_MIN_COMMITS it is a
+    # no-op, so the small-fixture eval baseline is unchanged.
+    auto_specificity: bool = True
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
@@ -134,6 +145,7 @@ class Config:
         cfg = cls()
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
                     "file_df_max", "token_df_max", "dir_df_max",
+                    "auto_specificity",
                     "score_arch_threshold", "score_borderline_threshold"):
             if key in raw:
                 setattr(cfg, key, raw[key])
@@ -234,6 +246,7 @@ class Candidate:
     classification: str  # architectural | borderline | skip
     title_hint: str
     output_dir: str
+    diff_summary: dict = field(default_factory=dict)
 
 
 # --- git helpers -------------------------------------------------------------
@@ -416,6 +429,54 @@ class Specificity:
         if self.dir_df_max is None:
             return shared
         return {d for d in shared if self.ddf.get(d, 0) <= self.dir_df_max}
+
+
+def resolve_specificity_caps(cfg: Config, commit_count: int) -> tuple:
+    """Effective (file, token, dir) df caps after auto-tuning.
+
+    Explicit caps always win. Otherwise, when auto_specificity is on and the
+    repo is large enough, derive a single deterministic cap from commit count.
+    Returns the caps unchanged (None unless set) in every opt-out case, so the
+    small-fixture eval baseline is untouched.
+    """
+    explicit = (cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max)
+    if not cfg.auto_specificity or any(c is not None for c in explicit):
+        return explicit
+    if commit_count <= AUTO_SPEC_MIN_COMMITS:
+        return explicit
+    cap = max(3, commit_count // AUTO_SPEC_DIVISOR)
+    return (cap, cap, cap)
+
+
+def diff_summary(group: list[Commit]) -> dict:
+    """File-level change summary for a candidate, so the skill can triage
+    without running `git diff` per candidate. Deterministic, no extra git call
+    (statuses already come from the name-status log)."""
+    added: set[str] = set()
+    deleted: set[str] = set()
+    modified: set[str] = set()
+    for c in group:
+        for f in c.files:
+            if f.status.startswith(("A", "R", "C")):
+                added.add(f.path)
+            elif f.status.startswith("D"):
+                deleted.add(f.path)
+            else:
+                modified.add(f.path)
+    modified -= added | deleted
+
+    def cap(paths: set[str], n: int) -> list[str]:
+        s = sorted(paths)
+        return s if len(s) <= n else s[:n] + [f"... +{len(s) - n} more"]
+
+    return {
+        "summary": f"+{len(added)} added, -{len(deleted)} deleted, "
+                   f"{len(modified)} modified",
+        "added": cap(added, 8),
+        "deleted": cap(deleted, 8),
+        "modified_count": len(modified),
+        "modified_top": cap(modified, 5),
+    }
 
 
 def build_specificity(commits: list[Commit], cfg: Config) -> Optional[Specificity]:
@@ -700,6 +761,10 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     commits = parse_log(repo, rev_range, pathspec)
     coupling = build_coupling(repo, pathspec)
     communities = build_leiden_communities(repo)
+    # auto-tune edge specificity from history size unless overridden
+    cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max = \
+        resolve_specificity_caps(cfg, len(commits))
+    preflight["specificity_cap"] = cfg.file_df_max
     spec = build_specificity(commits, cfg)
     chunks = chunk_commits(commits, strategy, cfg, coupling=coupling,
                            communities=communities, spec=spec)
@@ -724,6 +789,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             classification=cls,
             title_hint=group[0].subject,
             output_dir=out_dir,
+            diff_summary=diff_summary(group),
         ))
 
     return {
@@ -759,9 +825,12 @@ def main() -> int:
               f"next ADR: {pf['next_adr']:04d}  out: {pf['output_dir']}")
         if manifest.get("halt"):
             print(f"HALT: {manifest['halt']}")
+        if pf.get("specificity_cap") is not None:
+            print(f"specificity: df cap = {pf['specificity_cap']} (auto-tuned)")
         for c in manifest["candidates"]:
             print(f"  [{c['classification']:13}] score={c['score']:+d} "
                   f"{c['id']} ({len(c['commits'])} commit) :: {c['title_hint']}")
+            print(f"      {c['diff_summary']['summary']}")
     return 0
 
 
