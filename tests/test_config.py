@@ -101,3 +101,75 @@ def test_from_file_bare_set_replaces(tmp_path):
     p.write_text(json.dumps({"stopwords": ["only", "these"]}))
     cfg = Config.from_file(str(p))
     assert cfg.stopwords == frozenset({"only", "these"})
+
+
+# --- edge specificity (hot-file / IDF de-chaining) ---------------------------
+
+def _home(cands, marker):
+    """id() of the candidate whose subjects contain `marker`."""
+    for c in cands:
+        if any(marker in s for s in c["subjects"]):
+            return id(c)
+    return None
+
+
+def test_hotfile_repo_collapses_without_specificity():
+    """Baseline (presence-only overlap) collapses the hot-file repo: every commit
+    shares app/server.py + the 'endpoint' token, so union-find chains them."""
+    cands = _candidates("repo_hotfile")
+    sizes = sorted((len(c["commits"]) for c in cands), reverse=True)
+    assert sizes[0] >= 9, f"expected a mega-cluster at baseline, got {sizes}"
+
+
+def test_specificity_dechains_hotfile_repo():
+    """With file/token/dir df caps, the hot file, recurring token and hot top dir
+    stop binding, so the three features separate into distinct candidates."""
+    cfg = Config(file_df_max=4, token_df_max=4, dir_df_max=4)
+    cands = _candidates("repo_hotfile", cfg)
+    sizes = sorted((len(c["commits"]) for c in cands), reverse=True)
+    assert sizes[0] <= 3, f"specificity should break the mega-cluster, got {sizes}"
+    homes = {_home(cands, m) for m in ("alpha", "beta", "gamma")}
+    assert None not in homes, "each feature should have a candidate"
+    assert len(homes) == 3, "alpha / beta / gamma must not be merged together"
+
+
+# --- auto-tuned specificity --------------------------------------------------
+
+def test_auto_specificity_noop_for_small_repos():
+    """At fixture scale (<= AUTO_SPEC_MIN_COMMITS) auto-tune is a no-op, so the
+    eval baseline is preserved."""
+    caps = analyze.resolve_specificity_caps(Config(), analyze.AUTO_SPEC_MIN_COMMITS)
+    assert caps == (None, None, None)
+
+
+def test_auto_specificity_applies_for_large_repos():
+    n = 240
+    caps = analyze.resolve_specificity_caps(Config(), n)
+    assert caps == (max(3, n // analyze.AUTO_SPEC_DIVISOR),) * 3
+
+
+def test_explicit_caps_override_auto():
+    caps = analyze.resolve_specificity_caps(Config(file_df_max=2), 240)
+    assert caps == (2, None, None)
+
+
+def test_auto_specificity_can_be_disabled():
+    caps = analyze.resolve_specificity_caps(Config(auto_specificity=False), 240)
+    assert caps == (None, None, None)
+
+
+def test_hotfile_baseline_collapse_survives_auto_tune():
+    """repo_hotfile (10 commits) is below the auto-tune floor, so Config() must
+    still reproduce the documented mega-cluster."""
+    cands = _candidates("repo_hotfile")
+    assert max(len(c["commits"]) for c in cands) >= 9
+
+
+# --- diff summary ------------------------------------------------------------
+
+def test_diff_summary_present_and_shaped():
+    cands = _candidates("repo_modules", code="module:src/payments")
+    ds = cands[0]["diff_summary"]
+    assert "added" in ds["summary"] and "modified" in ds["summary"]
+    assert isinstance(ds["added"], list)
+    assert "modified_count" in ds

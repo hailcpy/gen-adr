@@ -53,6 +53,18 @@ Throughout the rest of this skill, `docs/decisions/` refers to the **scope-resol
 5. TAG        → place @ADR inline markers in code
 ```
  
+### Quick mode (default for repos under ~500 commits)
+
+The full loop above earns its weight on large histories with many interleaved decisions. For a small/medium repo it is overkill — `analyze.py` already does the heavy lifting deterministically, so use it as a **scored classifier** and write from its output:
+
+1. Run once: `python3 scripts/analyze.py <repo> [--code module:<path>] --json`. With no `--config`, edge specificity auto-tunes from commit count, so clustering is sane out-of-box (no mega-cluster).
+2. Triage from the JSON directly — each candidate carries `score`, `classification`, and a `diff_summary` (files added/deleted/modified), so you can rank without running `git diff` by hand.
+3. Still honour the **Step 4 hard gate**: before writing each MADR, read the actual diff for that candidate (`diff_summary` is for triage, not a substitute). Write straight from the MADR template.
+4. Verify with `judge.py verify-adr` / `check-tags` as the safety net.
+5. Skip CHUNK/CLUSTER hand-curation and batch-generation choreography — they add no value at this scale.
+
+Reach for the full loop only when a repo is large (≈500+ commits), has heavy merge/squash boundaries, or when `analyze.py` candidates clearly span multiple decisions that need manual splitting/merging.
+
 ---
  
 ## Step 0: Preflight Checks
@@ -184,6 +196,15 @@ This pass is **deterministic by design** — no embeddings, no temporal proximit
 - A chunk that clusters with nothing stays a singleton candidate — that is fine.
  
 The output of this step is a list of **decision candidates**, each backed by one or more chunks. Steps 3–5 operate on candidates, not raw chunks.
+ 
+**Mega-cluster guard (small / hot-file repos).** Clustering is connected-components over a pairwise-affinity graph, so even *sparse* overlap collapses into one giant cluster once a "hot" file or directory (touched by a large fraction of commits) or a recurring word binds otherwise-unrelated commits — relatedness is not transitive. Watch for it:
+- A candidate carrying a `WARN: oversized cluster` signal, **or** one candidate that swallows more than ~25% of all commits → the affinity graph has collapsed.
+- Fix deterministically by re-running `analyze.py --config knobs.json` with **edge specificity** caps so only *rare* shared files/tokens/dirs count as affinity (IDF intuition: a file edited in 25% of commits proves nothing about two commits being one decision):
+  ```json
+  { "file_df_max": 4, "token_df_max": 4, "dir_df_max": 4 }
+  ```
+  Start at ~`max(3, commits/40)` for each cap and tighten until the largest cluster is a believable single decision. These default to `null` (off) so the eval baseline is unchanged.
+- Do NOT reach for embeddings/LLM here: that addresses the opposite problem (merging commits that share *no* files/words — see the v2 note), would cluster on the same low-signal commit messages, and discards the deterministic, regression-testable guarantee.
  
 > **v2 note (not implemented here):** semantic clustering via embeddings + graph community detection would also catch conceptually-related PRs that share no files. It is deliberately out of scope: it is non-deterministic, needs a vector store, and would make output impossible to regression-test. Prototype it offline and prove it beats this deterministic pass before adopting it.
  
