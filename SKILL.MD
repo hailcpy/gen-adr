@@ -53,6 +53,18 @@ Throughout the rest of this skill, `docs/decisions/` refers to the **scope-resol
 5. TAG        → place @ADR inline markers in code
 ```
  
+### Quick mode (default for repos under ~500 commits)
+
+The full loop above earns its weight on large histories with many interleaved decisions. For a small/medium repo it is overkill — `analyze.py` already does the heavy lifting deterministically, so use it as a **scored classifier** and write from its output:
+
+1. Run once: `python3 scripts/analyze.py <repo> [--code module:<path>] --json`. With no `--config`, edge specificity auto-tunes from commit count, so clustering is sane out-of-box (no mega-cluster).
+2. Triage from the JSON directly — each candidate carries `score`, `classification`, and a `diff_summary` (files added/deleted/modified), so you can rank without running `git diff` by hand.
+3. Still honour the **Step 4 hard gate**: before writing each MADR, read the actual diff for that candidate (`diff_summary` is for triage, not a substitute). Write straight from the MADR template.
+4. Verify with `judge.py verify-adr` / `check-tags` as the safety net.
+5. Skip CHUNK/CLUSTER hand-curation and batch-generation choreography — they add no value at this scale.
+
+Reach for the full loop only when a repo is large (≈500+ commits), has heavy merge/squash boundaries, or when `analyze.py` candidates clearly span multiple decisions that need manual splitting/merging.
+
 ---
  
 ## Step 0: Preflight Checks
