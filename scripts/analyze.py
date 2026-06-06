@@ -27,6 +27,14 @@ import sys
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+try:
+    from leiden_signal import build_leiden_communities, commits_share_community
+    _LEIDEN_AVAILABLE = True
+except ImportError:
+    _LEIDEN_AVAILABLE = False
+    build_leiden_communities = lambda *_: None  # type: ignore[assignment]
+    commits_share_community = lambda *_: False  # type: ignore[assignment]
+
 # --- constants ---------------------------------------------------------------
 
 COUPLING_MIN_SHARED = 5   # Tornhill's empirical minimums from code-maat
@@ -303,13 +311,12 @@ def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
 
 
 def chunk_commits(commits: list[Commit], strategy: str,
-                  cfg: Config, coupling: Optional[dict] = None) -> list[list[Commit]]:
+                  cfg: Config, coupling: Optional[dict] = None,
+                  communities: Optional[dict] = None) -> list[list[Commit]]:
     """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster()."""
     if strategy in ("squash-boundary", "merge-boundary", "mixed"):
-        # each commit is its own chunk; cluster() bundles related ones
         return [[c] for c in commits]
-    # direct-commit: union-find by file-path affinity (no temporal grouping)
-    return _affinity_groups(commits, cfg, coupling=coupling)
+    return _affinity_groups(commits, cfg, coupling=coupling, communities=communities)
 
 
 def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
@@ -354,26 +361,38 @@ def _coupled(a_paths: set[str], b_paths: set[str], coupling: dict) -> bool:
 
 
 def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str],
-            a_paths: set[str], b_paths: set[str], coupling: Optional[dict] = None) -> bool:
-    """Merge when ≥2 of 3 independent signals agree.
+            a_paths: set[str], b_paths: set[str], coupling: Optional[dict] = None,
+            communities: Optional[dict] = None) -> bool:
+    """Merge when ≥2 of 4 independent signals agree.
 
     1. file/dir overlap    — same files or deep-directory prefix
     2. topic-token overlap — distinctive words from commit messages / new-file names
     3. co-change coupling  — historical Jaccard coupling from full repo history
+    4. Leiden community    — shared community in tree-sitter import graph (optional)
 
     Requiring two independent signals prevents the classic false-merge pairs:
     file-only ('everyone edits the same generic file') and topic-only ('two
-    unrelated cache PRs'). Coupling as a third signal raises recall for commits
-    that share no files in this window but always co-change in history.
+    unrelated cache PRs'). Coupling raises recall for commits that share no files
+    in this window but always co-change in history. The community signal further
+    raises recall for structurally related modules that haven't co-changed yet.
     """
     file_overlap  = bool(a_paths & b_paths) or bool(a_dirs & b_dirs)
     topic_overlap = bool(a_tok & b_tok)
     coupled       = _coupled(a_paths, b_paths, coupling) if coupling else False
-    return sum([file_overlap, topic_overlap, coupled]) >= 2
+    # Community is only a meaningful second signal when there is no direct file
+    # overlap — otherwise the same shared file would fire both file_overlap and
+    # community_match, silently collapsing the two-signal guard into one.
+    community_match = (
+        not file_overlap
+        and communities is not None
+        and commits_share_community(a_paths, b_paths, communities)
+    )
+    return sum([file_overlap, topic_overlap, coupled, community_match]) >= 2
 
 
 def _affinity_groups(commits: list[Commit], cfg: Config,
-                     coupling: Optional[dict] = None) -> list[list[Commit]]:
+                     coupling: Optional[dict] = None,
+                     communities: Optional[dict] = None) -> list[list[Commit]]:
     n = len(commits)
     parent = list(range(n))
 
@@ -393,6 +412,7 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
                 commits[i].topic_tokens(cfg), commits[j].topic_tokens(cfg),
                 commits[i].paths, commits[j].paths,
                 coupling=coupling,
+                communities=communities,
             ):
                 union(i, j)
 
@@ -404,12 +424,13 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
 
 
 def cluster(chunks: list[list[Commit]], cfg: Config,
-            coupling: Optional[dict] = None) -> list[list[Commit]]:
+            coupling: Optional[dict] = None,
+            communities: Optional[dict] = None) -> list[list[Commit]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
-    Merge when ≥2 of 3 signals agree: file overlap, topic-token overlap,
-    co-change coupling. Deterministic. Oversized clusters (> cfg.cluster_cap
-    commits) are split when cfg.split_oversized, else kept whole.
+    Merge when ≥2 of 4 signals agree: file overlap, topic-token overlap,
+    co-change coupling, Leiden community match. Deterministic. Oversized
+    clusters (> cfg.cluster_cap) are split when cfg.split_oversized.
     """
     m = len(chunks)
     parent = list(range(m))
@@ -436,7 +457,7 @@ def cluster(chunks: list[list[Commit]], cfg: Config,
         for j in range(i + 1, m):
             di, ti, pi = aggs[i]
             dj, tj, pj = aggs[j]
-            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling):
+            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling, communities=communities):
                 union(i, j)
 
     groups: dict[int, list[Commit]] = {}
@@ -568,6 +589,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         "commit_count": commit_count(repo, rev_range),
         "next_adr": next_adr_number(repo, out_dir),
         "output_dir": out_dir,
+        "leiden_available": _LEIDEN_AVAILABLE,
     }
     # hard stop on shallow — surfaced to skill, which halts
     if preflight["shallow"]:
@@ -577,8 +599,9 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     strategy = detect_strategy(repo, pathspec)
     commits = parse_log(repo, rev_range, pathspec)
     coupling = build_coupling(repo, pathspec)
-    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling)
-    clusters = cluster(chunks, cfg, coupling=coupling)
+    communities = build_leiden_communities(repo)
+    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling, communities=communities)
+    clusters = cluster(chunks, cfg, coupling=coupling, communities=communities)
 
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
