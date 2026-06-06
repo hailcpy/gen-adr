@@ -169,15 +169,30 @@ If a checker's tool isn't installed on the host (e.g. `gofmt`, `node`, `ruby`), 
 
 ## Installation
 
-Drop `SKILL.md` into your agent's skill directory. For Claude with the skills system:
+The skill requires three components to be co-located: the skill definition (`SKILL.md`), the deterministic scripts (`scripts/`), and the reference files (`references/`). Clone the repo and symlink or copy the whole directory into your Claude skills folder:
+
+```bash
+git clone https://github.com/hailcpy/gen-adr.git
+cp -r gen-adr ~/.claude/skills/adr-generator
+```
+
+The resulting layout should be:
 
 ```
-skills/
+~/.claude/skills/
 └── adr-generator/
-    └── SKILL.md
+    ├── SKILL.md
+    ├── scripts/
+    │   ├── analyze.py   ← deterministic chunking/clustering/classification
+    │   └── judge.py     ← citation verifier and tag syntax checker
+    └── references/
+        ├── madr-examples.md
+        └── language-tag-patterns.md
 ```
 
-The agent will pick it up automatically when you ask it to generate ADRs or document architectural decisions.
+**Requirements:** Python 3 (stdlib only — no `pip install` needed). For Go syntax checking, `gofmt` must be on `PATH`; all other checked languages use built-in tools (`node`, `ruby`, `bash -n`). If a checker tool is absent, that file is skipped rather than failed.
+
+The agent will pick up the skill automatically when you ask it to generate ADRs or document architectural decisions.
 
 ---
 
