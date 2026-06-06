@@ -41,6 +41,8 @@ docs/decisions/
 
 Each file follows the [MADR template](https://adr.github.io/madr/) with a retroactive notice and links to original commits.
 
+Pass `--json` to `analyze.py` to get machine-readable candidates — each entry includes `score`, `classification`, and a `diff_summary` (files added/deleted/modified) so the agent can rank and triage without running `git diff` manually. Edge specificity auto-tunes from commit count by default, so clustering is sane out-of-box with no extra config.
+
 ### Inline `@ADR` tags in code
 
 ```python
@@ -59,8 +61,16 @@ A coding agent can now `grep -r "@ADR"` and surface every architectural decision
 
 ## Modes
 
+### Quick (default for repos under ~500 commits)
+
+For small/medium repos the full multi-step loop is overkill. The agent runs `analyze.py` once as a scored classifier, reads its JSON output (each candidate carries `score`, `classification`, and a `diff_summary`), triages without calling `git diff` by hand, writes MARDs directly, then runs `judge.py` as the safety net.
+
+```
+"Run adr-generator on this repo"
+```
+
 ### Autonomous
-The agent detects everything and runs end-to-end without interruption. Best for an initial pass on a codebase you want to document quickly.
+The agent detects everything and runs the full chunking → clustering → classification → generation → verification loop without interruption. Best for large repos (≈500+ commits) or histories with many interleaved decisions across PR boundaries.
 
 ```
 "Run adr-generator on this repo in autonomous mode, scope to src/payments since v2.0.0"
@@ -202,6 +212,28 @@ The agent will pick up the skill automatically when you ask it to generate ADRs 
 Using the adr-generator skill, run in assisted mode on the module src/billing, 
 since the tag v1.4.0. I want to review each classification before you generate anything.
 ```
+
+---
+
+## Troubleshooting: Clustering Mega-Collapse
+
+Clustering is connected-components over a pairwise-affinity graph. A "hot" file or token touched by many commits can bridge otherwise-unrelated commits into one giant cluster.
+
+**Signs something is wrong:**
+- A candidate with `WARN: oversized cluster` in its output
+- One candidate that absorbs >25% of all commits
+
+**Fix:** re-run with a config file that caps edge specificity so only *rare* shared files/tokens/directories count as affinity:
+
+```bash
+python3 scripts/analyze.py <repo> --config knobs.json --json
+```
+
+```json
+{ "file_df_max": 4, "token_df_max": 4, "dir_df_max": 4 }
+```
+
+Start at roughly `max(3, commits/40)` for each cap and tighten until the largest cluster represents a believable single decision. These default to `null` (off), preserving the baseline for repos that don't need it.
 
 ---
 
