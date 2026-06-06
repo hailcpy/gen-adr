@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="adr-generator" width="600"/>
+  <img src="assets/logo.png?v=2" alt="adr-generator" width="600"/>
 </p>
 
 # adr-generator
