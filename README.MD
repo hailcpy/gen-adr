@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="adr-generator" width="600"/>
+</p>
+
 # adr-generator
 
 A skill for AI coding agents (Claude) that retroactively generates [MADR](https://adr.github.io/madr/)-format Architectural Decision Records from an existing codebase's git history, and annotates relevant code with inline `@ADR` reference tags.
