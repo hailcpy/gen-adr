@@ -135,6 +135,36 @@ The biggest risk with retroactive documentation is the AI confidently making thi
 - **Rationale** is only drawn from commit messages and diff context. If unclear, the MADR says so explicitly rather than fabricating a reason.
 - Every generated MADR includes a header note: `"This ADR was retroactively generated from commit history. Rationale accuracy depends on commit message quality."`
 
+### Output verification
+
+Beyond the in-generation rules above, a verification pass (`scripts/judge.py`) re-checks the output instead of trusting the generator to police itself.
+
+**Considered Options — citation-grounded and fully deterministic.** The generator must *cite* each option inline (a hidden `<!-- evidence: <sha> deleted:path -->` comment). Because the git history is a closed corpus, every check is an exact lookup, not a model call:
+
+- Confirm the cited SHA exists, then confirm the claimed change is real: file `deleted`/`added`/`renamed` (name-status), `removed:"line"` (grep the commit's diff for that deleted line — this covers code replaced *inside* a modified file), or a `message:` phrase. A fabricated SHA or a change that didn't happen → the option is dropped. An uncited option, or one citing an evidence type that can't be checked → dropped.
+- There is **no LLM on the verification path**. An option that can only be argued semantically is dropped, not adjudicated — for a retroactive ADR, if you can't point at the bytes, it shouldn't be asserted. (This replaced an earlier LLM-judge design: a model verdict over terse commit metadata measures sample *variance*, not the judge's *systematic* over-inference, so citation grounding is both stronger and reproducible.)
+
+Surviving options are kept; the rest are dropped (collapsing to "No alternatives recorded" if none survive), and the ADR's frontmatter is stamped `evidence-verified: true`. A downstream agent reading that flag should **trust the prose and not re-investigate the cited commits** — the citations are an audit trail, not a re-check prompt.
+
+**Tag syntax check (deterministic).** After `@ADR` tags are inserted, each touched file is parse-checked with the language's own compiler so a misplaced comment can't break the build. No model is involved.
+
+### Tag validation coverage
+
+The deterministic syntax check supports a **fixed set** of languages. Files outside this set still get tags placed, but the syntax check **skips** them (it never false-fails):
+
+| Language | `@ADR` tags placed | Syntax-checked |
+|----------|:---:|:---:|
+| Python | ✅ | ✅ |
+| JavaScript (`.js` / `.mjs` / `.cjs`) | ✅ | ✅ |
+| Ruby | ✅ | ✅ |
+| Shell (`.sh` / `.bash`) | ✅ | ✅ |
+| Go | ✅ | ✅ *(requires `gofmt` on `PATH`)* |
+| TypeScript (`.ts` / `.tsx`) | ✅ | ❌ skipped |
+| Java / Kotlin | ✅ | ❌ skipped |
+| Rust | ✅ | ❌ skipped |
+
+If a checker's tool isn't installed on the host (e.g. `gofmt`, `node`, `ruby`), that file is also skipped rather than failed.
+
 ---
 
 ## Installation

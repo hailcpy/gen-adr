@@ -286,12 +286,23 @@ not just what was added.>
  
 ## Considered Options
  
-<STRICT RULE: Only list options that are directly evidenced:
-  - Code being replaced/deleted in the diff (old approach)
-  - Explicit "instead of X" / "replacing Y" in commit message
-  - Branch name referencing an alternative approach
-If none evidenced: write exactly "No alternatives recorded in commit history." and leave the list empty.
-DO NOT populate this with plausible alternatives from general knowledge.>
+<STRICT RULE: Only list options that are directly evidenced, and CITE each one
+inline with a hidden HTML-comment so the verifier can check it against git:
+ 
+  - `* <option> <!-- evidence: <sha> deleted:<path> -->`     (whole file for the old approach removed)
+  - `* <option> <!-- evidence: <sha> added:<path> -->`       (new approach added)
+  - `* <option> <!-- evidence: <sha> renamed:<path> -->`     (file moved/renamed)
+  - `* <option> <!-- evidence: <sha> removed:"<line>" -->`   (a specific deleted line — for code replaced *inside* a modified file)
+  - `* <option> <!-- evidence: <sha> message:<phrase> -->`   (phrase in commit msg, e.g. "instead of redis")
+ 
+The `<sha>` MUST be one of this candidate's commits, and the cited change must be
+real — the verifier checks each citation against git and DROPS any option whose
+citation does not hold up. Prefer `removed:"<exact deleted line>"` over a vague
+claim: if an alternative is only evidenced by code changed inside a file, cite the
+actual line that was deleted. Every option needs a citation — an option you cannot
+pin to a specific commit and change does not belong here. If none are evidenced,
+write exactly "No alternatives recorded in commit history." and leave the list
+empty. DO NOT populate this with plausible alternatives from general knowledge.>
  
 ## Decision Outcome
  
@@ -323,6 +334,36 @@ The most likely hallucination point is "Considered Options." Enforce this mental
 > "Can I point to a specific line in the diff or commit message that shows this alternative existed? If not, it goes in the empty list with the 'No alternatives recorded' note."
  
 In **assisted mode**, show the draft and wait for `[write / edit / skip]` before touching disk.
+ 
+### Verify Considered Options (deterministic citation check)
+ 
+After writing an ADR, run the verifier. It checks every option's inline citation against git and rewrites the section to keep only what holds up. **No model is involved — same repo + text always yields the same result:**
+ 
+```bash
+python3 scripts/judge.py verify-adr docs/decisions/<NNNN-slug>.md \
+    --repo . --write --json
+```
+ 
+For each option's citation it confirms the SHA exists, then confirms the claimed change is real: `deleted`/`added`/`renamed` against name-status, `removed:"line"` by grepping the commit's diff for that deleted line, `message:` by searching the commit message. An option is **dropped** if its citation fails, if its evidence type is not one of these (uncheckable), or if it has **no citation at all**. Because the git history is a closed corpus, every check is an exact lookup — a fabricated SHA fails `git cat-file` immediately.
+ 
+With `--write`, the verifier rewrites the section (dropping unevidenced options, collapsing to "No alternatives recorded" if none survive) and stamps the frontmatter (see below). Run without `--write` to preview the kept/dropped table first; in **assisted mode**, preview, then apply.
+ 
+> An option that can only be argued semantically — not pinned to a specific commit and change — is dropped, not adjudicated by an LLM. For a retroactive ADR that is the correct call: if you cannot point at the bytes, it should not be asserted as a considered option.
+ 
+### Provenance and the downstream trust boundary
+ 
+`verify-adr --write` stamps the ADR's YAML frontmatter:
+ 
+```yaml
+generation:
+  method: gen-adr/v1
+  evidence-verified: true
+  verification: citation-structural
+  options-kept: 2
+  options-dropped: 1
+```
+ 
+The per-option `<!-- evidence: ... -->` comments are kept (invisible when rendered) as an audit trail. **This is a trust boundary, not an invitation to re-check.** A downstream coding agent reading an ADR with `evidence-verified: true` should **trust the Considered Options prose as already cross-checked against git, and must NOT re-investigate the cited commits.** The citations exist for a human auditor or a re-run of `verify-adr`, not for the consuming agent to chase. Treat the listed options as the verified historical decision space.
  
 ---
  
@@ -369,6 +410,20 @@ ADR-0004 tag placements:
   src/events/queue.py:10      → class EventQueue
 Confirm? [yes / adjust / skip tagging]
 ```
+ 
+### Verify tag syntax (after placement)
+ 
+A misplaced comment can break a file. After writing tags, parse-check every file you touched:
+ 
+```bash
+python3 scripts/judge.py check-tags . <file1> <file2> ... --json
+```
+ 
+- **`ok`** → the tag parsed cleanly, keep it.
+- **`fail`** → the tag broke the file. Revert that one insertion (or move it to a safer line — e.g. above the `def`/`func` rather than inside a signature) and re-check.
+- **`skipped`** → no syntax checker for that language, or the tool isn't installed. The tag is kept un-verified; note it in the run summary.
+ 
+**Syntax-check coverage is a fixed set:** Python, JavaScript (`.js`/`.mjs`/`.cjs`), Ruby, Shell (`.sh`/`.bash`), and Go (needs `gofmt` on `PATH`). TypeScript, Java/Kotlin, and Rust get tags placed but are **not** parse-checked yet — they return `skipped`. For those, eyeball the insertion point.
  
 ---
  
