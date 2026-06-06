@@ -185,6 +185,15 @@ This pass is **deterministic by design** — no embeddings, no temporal proximit
  
 The output of this step is a list of **decision candidates**, each backed by one or more chunks. Steps 3–5 operate on candidates, not raw chunks.
  
+**Mega-cluster guard (small / hot-file repos).** Clustering is connected-components over a pairwise-affinity graph, so even *sparse* overlap collapses into one giant cluster once a "hot" file or directory (touched by a large fraction of commits) or a recurring word binds otherwise-unrelated commits — relatedness is not transitive. Watch for it:
+- A candidate carrying a `WARN: oversized cluster` signal, **or** one candidate that swallows more than ~25% of all commits → the affinity graph has collapsed.
+- Fix deterministically by re-running `analyze.py --config knobs.json` with **edge specificity** caps so only *rare* shared files/tokens/dirs count as affinity (IDF intuition: a file edited in 25% of commits proves nothing about two commits being one decision):
+  ```json
+  { "file_df_max": 4, "token_df_max": 4, "dir_df_max": 4 }
+  ```
+  Start at ~`max(3, commits/40)` for each cap and tighten until the largest cluster is a believable single decision. These default to `null` (off) so the eval baseline is unchanged.
+- Do NOT reach for embeddings/LLM here: that addresses the opposite problem (merging commits that share *no* files/words — see the v2 note), would cluster on the same low-signal commit messages, and discards the deterministic, regression-testable guarantee.
+ 
 > **v2 note (not implemented here):** semantic clustering via embeddings + graph community detection would also catch conceptually-related PRs that share no files. It is deliberately out of scope: it is non-deterministic, needs a vector store, and would make output impossible to regression-test. Prototype it offline and prove it beats this deterministic pass before adopting it.
  
 In **assisted mode**, show the proposed candidates (which chunks merged into each, and why) and let the user split/merge before classifying.

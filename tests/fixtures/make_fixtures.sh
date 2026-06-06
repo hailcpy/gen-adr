@@ -154,4 +154,55 @@ commit "$R5" 2024-02-01 "feat: adopt grpc transport in payments (#10)"
 echo "export const n = () => {};" > "$R5/services/notifications/grpc_client.ts"
 commit "$R5" 2024-03-01 "feat: adopt grpc transport in notifications (#20)"
 
+# ---------------------------------------------------------------------------
+# Repo 6: a single DEEP module (services/findings) holding TWO distinct
+# subsystems (correlation, streaming). Every file shares the module prefix at
+# absolute depth 2, and every subject shares the "findings" topic token. Before
+# module-relative depth, file_overlap fired for every pair and the shared token
+# chained all four commits into ONE mega-cluster. Scoped to module:services/
+# findings the two subsystems must stay TWO candidates.
+# ---------------------------------------------------------------------------
+R6="$OUT/repo_deepmodule"
+init "$R6"
+mkdir -p "$R6/services/findings/correlation" "$R6/services/findings/streaming"
+echo "export const corr = () => {};" > "$R6/services/findings/correlation/engine.ts"
+commit "$R6" 2024-01-01 "feat: add correlation engine to findings (#1)"
+echo "export const score = () => {};" > "$R6/services/findings/correlation/score.ts"
+commit "$R6" 2024-01-05 "feat: extend correlation scoring in findings (#2)"
+echo "export const ingest = () => {};" > "$R6/services/findings/streaming/ingest.ts"
+commit "$R6" 2024-02-01 "feat: add streaming ingest to findings (#3)"
+echo "export const buffer = () => {};" > "$R6/services/findings/streaming/buffer.ts"
+commit "$R6" 2024-02-05 "feat: tune streaming backpressure in findings (#4)"
+
+# ---------------------------------------------------------------------------
+# Repo 7: small repo with a HOT FILE (app/server.py, edited every commit) and a
+# recurring token ("endpoint", in every subject). Three genuinely distinct
+# features (alpha/beta/gamma) each live in their own dir + carry their own rare
+# token. With presence-only overlap, every pair shares the hot file AND the
+# recurring token -> two signals -> union-find chains all of them into ONE
+# mega-cluster. Specificity caps (file/token/dir df) drop the hot file, the
+# recurring token and the hot top dir, leaving only the rare per-feature signal
+# -> the three features separate.
+# ---------------------------------------------------------------------------
+R7="$OUT/repo_hotfile"
+init "$R7"
+mkdir -p "$R7/app/alpha" "$R7/app/beta" "$R7/app/gamma"
+echo "v1" > "$R7/app/server.py"
+commit "$R7" 2024-01-01 "feat: bootstrap server endpoint (#1)"
+hot() {  # hot <date> <feature> <subject>  — touch hot file + the feature file
+  local n; n=$(wc -l < "$R7/app/server.py" | tr -d ' ')
+  echo "line$((n+1))" >> "$R7/app/server.py"
+  echo "# $3" >> "$R7/app/$2/handler.py"
+  commit "$R7" "$1" "$3"
+}
+hot 2024-01-02 alpha "feat: add alpha endpoint (#2)"
+hot 2024-01-03 alpha "fix: alpha endpoint validation (#3)"
+hot 2024-01-04 alpha "feat: extend alpha endpoint (#4)"
+hot 2024-01-05 beta  "feat: add beta endpoint (#5)"
+hot 2024-01-06 beta  "fix: beta endpoint retries (#6)"
+hot 2024-01-07 beta  "feat: extend beta endpoint (#7)"
+hot 2024-01-08 gamma "feat: add gamma endpoint (#8)"
+hot 2024-01-09 gamma "fix: gamma endpoint caching (#9)"
+hot 2024-01-10 gamma "feat: extend gamma endpoint (#10)"
+
 echo "fixtures built in $OUT"

@@ -253,3 +253,54 @@ def test_crossmodule_clustering_is_a_known_gap(labels):
     homes = {id(candidate_with(cands, m)) for m in markers}
     # IDEAL behavior (currently fails): both grpc PRs in one candidate.
     assert len(homes) == 1
+
+
+# --- module-relative dir overlap ---------------------------------------------
+
+def _commit(sha, subject, *paths):
+    return analyze.Commit(
+        sha=sha, author="a", date="2024-01-01", parents=[], subject=subject,
+        files=[analyze.FileChange(status="M", path=p) for p in paths],
+    )
+
+
+def test_module_root_does_not_bind_under_module_scope():
+    """Two commits both living directly in the module root must NOT dir-overlap.
+
+    Without the relative-depth shift, every file under a depth-2 module shares
+    the `services/fetch_findings` prefix at absolute depth 2, so file_overlap
+    fires for every pair and the whole module collapses into one mega-cluster.
+    """
+    a = _commit("a", "add rapid7", "services/fetch_findings/vendor.py")
+    b = _commit("b", "add sentinelone", "services/fetch_findings/services.py")
+
+    repo_cfg = analyze.Config()  # no module scope → coarse prefix still binds
+    assert a.dirs_deep(repo_cfg) & b.dirs_deep(repo_cfg)
+
+    mod_cfg = analyze.Config(module_prefix="services/fetch_findings")
+    assert not (a.dirs_deep(mod_cfg) & b.dirs_deep(mod_cfg)), \
+        "module root must not bind two commits under module scope"
+
+
+def test_first_subdir_inside_module_binds():
+    """Relative depth 1 (the first subdir inside the module) is the bind unit."""
+    a = _commit("a", "stream a", "services/fetch_findings/correlation/engine.py")
+    b = _commit("b", "stream b", "services/fetch_findings/correlation/state.py")
+    cfg = analyze.Config(module_prefix="services/fetch_findings")
+    assert a.dirs_deep(cfg) & b.dirs_deep(cfg) == {"services/fetch_findings/correlation"}
+
+
+def test_module_scope_no_mega_cluster():
+    """End-to-end: distinct subsystems inside one deep module stay distinct.
+
+    repo_deepmodule packs correlation + streaming under services/findings, all
+    sharing the module prefix and the "findings" topic token. Pre-fix this
+    collapsed into one mega-cluster; now it must split by subsystem.
+    """
+    cands = candidates("repo_deepmodule", code="module:services/findings")
+    assert len(cands) == 2, \
+        f"expected 2 subsystem candidates, got {len(cands)}"
+    corr = candidate_with(cands, "correlation")
+    stream = candidate_with(cands, "streaming")
+    assert corr is not None and stream is not None
+    assert id(corr) != id(stream), "correlation and streaming must not merge"

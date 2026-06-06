@@ -101,3 +101,33 @@ def test_from_file_bare_set_replaces(tmp_path):
     p.write_text(json.dumps({"stopwords": ["only", "these"]}))
     cfg = Config.from_file(str(p))
     assert cfg.stopwords == frozenset({"only", "these"})
+
+
+# --- edge specificity (hot-file / IDF de-chaining) ---------------------------
+
+def _home(cands, marker):
+    """id() of the candidate whose subjects contain `marker`."""
+    for c in cands:
+        if any(marker in s for s in c["subjects"]):
+            return id(c)
+    return None
+
+
+def test_hotfile_repo_collapses_without_specificity():
+    """Baseline (presence-only overlap) collapses the hot-file repo: every commit
+    shares app/server.py + the 'endpoint' token, so union-find chains them."""
+    cands = _candidates("repo_hotfile")
+    sizes = sorted((len(c["commits"]) for c in cands), reverse=True)
+    assert sizes[0] >= 9, f"expected a mega-cluster at baseline, got {sizes}"
+
+
+def test_specificity_dechains_hotfile_repo():
+    """With file/token/dir df caps, the hot file, recurring token and hot top dir
+    stop binding, so the three features separate into distinct candidates."""
+    cfg = Config(file_df_max=4, token_df_max=4, dir_df_max=4)
+    cands = _candidates("repo_hotfile", cfg)
+    sizes = sorted((len(c["commits"]) for c in cands), reverse=True)
+    assert sizes[0] <= 3, f"specificity should break the mega-cluster, got {sizes}"
+    homes = {_home(cands, m) for m in ("alpha", "beta", "gamma")}
+    assert None not in homes, "each feature should have a candidate"
+    assert len(homes) == 3, "alpha / beta / gamma must not be merged together"

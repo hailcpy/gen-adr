@@ -105,6 +105,18 @@ class Config:
     min_dir_depth: int = 2          # dir prefixes shorter than this don't bind
     cluster_cap: int = 8            # commits per cluster before it's "oversized"
     split_oversized: bool = False   # if True, split oversized clusters by date
+    module_prefix: str = ""         # set at runtime under module: scope; makes
+                                    # dir-overlap depth relative to the module
+                                    # root so the module path itself never binds
+    # edge specificity (IDF): a shared file/token only counts as affinity if it
+    # appears in <= N commits across the window. A file edited in a quarter of
+    # all commits ('hot file') carries no signal that two commits are one
+    # decision; without this, presence-only overlap + union-find transitive
+    # closure collapses small, hot-file repos into one mega-cluster. None
+    # disables filtering, so Config() reproduces the original eval baseline.
+    file_df_max: Optional[int] = None
+    token_df_max: Optional[int] = None
+    dir_df_max: Optional[int] = None
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
@@ -121,6 +133,7 @@ class Config:
             raw = json.load(fh)
         cfg = cls()
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
+                    "file_df_max", "token_df_max", "dir_df_max",
                     "score_arch_threshold", "score_borderline_threshold"):
             if key in raw:
                 setattr(cfg, key, raw[key])
@@ -166,16 +179,27 @@ class Commit:
         return dirs
 
     def dirs_deep(self, cfg: "Config") -> set[str]:
-        """Directory prefixes of depth >= cfg.min_dir_depth, for clustering overlap.
+        """Directory prefixes deep enough to imply two commits share a decision.
 
-        Depth-1 buckets (`src`, `lib`, `services`) are too coarse to imply two
-        commits belong to the same decision, so they are excluded by default.
-        `lib/cache` counts; `lib` alone does not.
+        Depth-1 buckets (`src`, `lib`, `services`) are too coarse to bind, so
+        binding starts one level below the coarse bucket: `lib/cache` counts;
+        `lib` alone does not (with the default `min_dir_depth=2`).
+
+        Under `module:` scope the module path *is* the coarse bucket. Measured
+        from the repo root every file would share that prefix at depth 2, so
+        file-overlap fires for every pair and the whole module collapses into
+        one cluster. To avoid that, the depth window is shifted by the module's
+        own depth: binding starts at `module_depth + 1`, i.e. the first subdir
+        *inside* the module — exactly mirroring the repo-root case where the
+        depth-1 bucket is excluded and bucket+1 binds.
         """
+        prefix_parts = [p for p in cfg.module_prefix.split("/") if p]
+        base_depth = len(prefix_parts) if prefix_parts else 1
+        start = base_depth + (cfg.min_dir_depth - 1)
         out: set[str] = set()
         for f in self.files:
             parts = f.path.split("/")[:-1]  # drop filename
-            for i in range(cfg.min_dir_depth, len(parts) + 1):
+            for i in range(start, len(parts) + 1):
                 out.add("/".join(parts[:i]))
         return out
 
@@ -312,11 +336,13 @@ def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
 
 def chunk_commits(commits: list[Commit], strategy: str,
                   cfg: Config, coupling: Optional[dict] = None,
-                  communities: Optional[dict] = None) -> list[list[Commit]]:
+                  communities: Optional[dict] = None,
+                  spec: Optional["Specificity"] = None) -> list[list[Commit]]:
     """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster()."""
     if strategy in ("squash-boundary", "merge-boundary", "mixed"):
         return [[c] for c in commits]
-    return _affinity_groups(commits, cfg, coupling=coupling, communities=communities)
+    return _affinity_groups(commits, cfg, coupling=coupling,
+                            communities=communities, spec=spec)
 
 
 def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
@@ -360,9 +386,62 @@ def _coupled(a_paths: set[str], b_paths: set[str], coupling: dict) -> bool:
     return False
 
 
+@dataclass
+class Specificity:
+    """Per-window document frequencies + caps for IDF-style edge filtering.
+
+    `fdf[path]` / `tdf[token]` = number of commits in the window touching that
+    file / carrying that token. A shared file or token only counts toward
+    file/topic overlap when its frequency is <= the corresponding cap, so that
+    'hot' files and ubiquitous words stop binding unrelated commits.
+    """
+    fdf: dict
+    tdf: dict
+    ddf: dict
+    file_df_max: Optional[int]
+    token_df_max: Optional[int]
+    dir_df_max: Optional[int]
+
+    def specific_files(self, shared: set[str]) -> set[str]:
+        if self.file_df_max is None:
+            return shared
+        return {p for p in shared if self.fdf.get(p, 0) <= self.file_df_max}
+
+    def specific_tokens(self, shared: set[str]) -> set[str]:
+        if self.token_df_max is None:
+            return shared
+        return {t for t in shared if self.tdf.get(t, 0) <= self.token_df_max}
+
+    def specific_dirs(self, shared: set[str]) -> set[str]:
+        if self.dir_df_max is None:
+            return shared
+        return {d for d in shared if self.ddf.get(d, 0) <= self.dir_df_max}
+
+
+def build_specificity(commits: list[Commit], cfg: Config) -> Optional[Specificity]:
+    """Compute file/token/dir document frequencies over the window, or None when
+    no cap is set (the cheap, baseline-identical path)."""
+    if (cfg.file_df_max is None and cfg.token_df_max is None
+            and cfg.dir_df_max is None):
+        return None
+    fdf: dict[str, int] = {}
+    tdf: dict[str, int] = {}
+    ddf: dict[str, int] = {}
+    for c in commits:
+        for p in c.paths:
+            fdf[p] = fdf.get(p, 0) + 1
+        for t in c.topic_tokens(cfg):
+            tdf[t] = tdf.get(t, 0) + 1
+        for d in c.dirs_deep(cfg):
+            ddf[d] = ddf.get(d, 0) + 1
+    return Specificity(fdf, tdf, ddf,
+                       cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max)
+
+
 def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str],
             a_paths: set[str], b_paths: set[str], coupling: Optional[dict] = None,
-            communities: Optional[dict] = None) -> bool:
+            communities: Optional[dict] = None,
+            spec: Optional["Specificity"] = None) -> bool:
     """Merge when ≥2 of 4 independent signals agree.
 
     1. file/dir overlap    — same files or deep-directory prefix
@@ -375,9 +454,22 @@ def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str]
     unrelated cache PRs'). Coupling raises recall for commits that share no files
     in this window but always co-change in history. The community signal further
     raises recall for structurally related modules that haven't co-changed yet.
+
+    When `spec` is given, the file and topic signals only count shared files /
+    tokens that are *specific* (low document-frequency). This stops 'hot' files
+    and ubiquitous words from binding unrelated commits — the failure mode that
+    collapses small repos into one cluster once union-find takes the transitive
+    closure of even sparse pairwise overlap. Coupling still uses the full paths.
     """
-    file_overlap  = bool(a_paths & b_paths) or bool(a_dirs & b_dirs)
-    topic_overlap = bool(a_tok & b_tok)
+    shared_files = a_paths & b_paths
+    shared_toks  = a_tok & b_tok
+    shared_dirs  = a_dirs & b_dirs
+    if spec is not None:
+        shared_files = spec.specific_files(shared_files)
+        shared_toks  = spec.specific_tokens(shared_toks)
+        shared_dirs  = spec.specific_dirs(shared_dirs)
+    file_overlap  = bool(shared_files) or bool(shared_dirs)
+    topic_overlap = bool(shared_toks)
     coupled       = _coupled(a_paths, b_paths, coupling) if coupling else False
     # Community is only a meaningful second signal when there is no direct file
     # overlap — otherwise the same shared file would fire both file_overlap and
@@ -392,7 +484,8 @@ def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str]
 
 def _affinity_groups(commits: list[Commit], cfg: Config,
                      coupling: Optional[dict] = None,
-                     communities: Optional[dict] = None) -> list[list[Commit]]:
+                     communities: Optional[dict] = None,
+                     spec: Optional["Specificity"] = None) -> list[list[Commit]]:
     n = len(commits)
     parent = list(range(n))
 
@@ -413,6 +506,7 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
                 commits[i].paths, commits[j].paths,
                 coupling=coupling,
                 communities=communities,
+                spec=spec,
             ):
                 union(i, j)
 
@@ -425,7 +519,8 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
 
 def cluster(chunks: list[list[Commit]], cfg: Config,
             coupling: Optional[dict] = None,
-            communities: Optional[dict] = None) -> list[list[Commit]]:
+            communities: Optional[dict] = None,
+            spec: Optional["Specificity"] = None) -> list[list[Commit]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
     Merge when ≥2 of 4 signals agree: file overlap, topic-token overlap,
@@ -457,7 +552,8 @@ def cluster(chunks: list[list[Commit]], cfg: Config,
         for j in range(i + 1, m):
             di, ti, pi = aggs[i]
             dj, tj, pj = aggs[j]
-            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling, communities=communities):
+            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling,
+                       communities=communities, spec=spec):
                 union(i, j)
 
     groups: dict[int, list[Commit]] = {}
@@ -576,6 +672,10 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     pathspec = None
     if code_scope.startswith("module:"):
         pathspec = code_scope.split(":", 1)[1]
+        # depth-overlap is measured relative to the module root, otherwise every
+        # file shares the module prefix and the whole module collapses into one
+        # cluster (see Commit.dirs_deep).
+        cfg.module_prefix = pathspec.rstrip("/")
 
     rev_range = None
     if history_scope.startswith("since:"):
@@ -600,8 +700,11 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     commits = parse_log(repo, rev_range, pathspec)
     coupling = build_coupling(repo, pathspec)
     communities = build_leiden_communities(repo)
-    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling, communities=communities)
-    clusters = cluster(chunks, cfg, coupling=coupling, communities=communities)
+    spec = build_specificity(commits, cfg)
+    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling,
+                           communities=communities, spec=spec)
+    clusters = cluster(chunks, cfg, coupling=coupling,
+                       communities=communities, spec=spec)
 
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
