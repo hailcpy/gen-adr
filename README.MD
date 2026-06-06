@@ -139,12 +139,14 @@ The biggest risk with retroactive documentation is the AI confidently making thi
 
 ## Installation
 
-The skill requires three components to be co-located: the skill definition (`SKILL.md`), the deterministic scripts (`scripts/`), and the reference files (`references/`). Clone the repo and symlink or copy the whole directory into your Claude skills folder:
+The skill requires three components to be co-located: the skill definition (`SKILL.md`), the deterministic scripts (`scripts/`), and the reference files (`references/`). Clone the repo and symlink it into your Claude skills folder:
 
 ```bash
 git clone https://github.com/hailcpy/gen-adr.git
-cp -r gen-adr ~/.claude/skills/adr-generator
+ln -s "$(pwd)/gen-adr" ~/.claude/skills/adr-generator
 ```
+
+The symlink means `git pull` inside the repo immediately takes effect — no re-copy needed. If you'd rather have a standalone copy instead, use `cp -r gen-adr ~/.claude/skills/adr-generator`.
 
 The resulting layout should be:
 
