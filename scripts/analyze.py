@@ -348,6 +348,15 @@ def verify_ref(repo: str, ref: str) -> bool:
     return res.returncode == 0
 
 
+def is_ancestor(repo: str, ref: str, head: str = "HEAD") -> bool:
+    """True iff `ref` is an ancestor of `head` in the current history."""
+    res = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", ref, head],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
 def read_diff(repo: str, base: str, head: str, path: str) -> str:
     """git diff <base> <head> -- <path>. Returns raw unified diff text, or '' on error."""
     res = subprocess.run(
@@ -1068,6 +1077,19 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
                 },
                 "halt": "bad_ref",
                 "halt_detail": f"reference '{ref}' is not a valid commit",
+                "strategy": None,
+                "scope": {"history": history_scope, "code": code_scope},
+                "candidates": [],
+            }
+        if not is_ancestor(repo, ref):
+            return {
+                "preflight": {
+                    "shallow": is_shallow(repo),
+                    "output_dir": output_dir_for(code_scope),
+                    "leiden_available": _LEIDEN_AVAILABLE,
+                },
+                "halt": "ref_not_ancestor",
+                "halt_detail": f"reference '{ref}' is not an ancestor of HEAD",
                 "strategy": None,
                 "scope": {"history": history_scope, "code": code_scope},
                 "candidates": [],
