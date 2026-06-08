@@ -44,7 +44,7 @@ echo "# App" > "$R1/README.md"
 commit "$R1" 2024-01-05 "docs: initial readme (#1)"
 
 mkdir -p "$R1/src"
-echo '{"name":"app","dependencies":{"moment":"^2.29.0"}}' > "$R1/package.json"
+printf '{\n  "name": "app",\n  "dependencies": {\n    "moment": "^2.29.0"\n  }\n}\n' > "$R1/package.json"
 echo "export const VERSION = '1.0.0';" > "$R1/src/index.ts"
 commit "$R1" 2024-01-20 "build: add package.json and entrypoint (#5)"
 
@@ -60,7 +60,7 @@ commit "$R1" 2024-02-10 "feat: add kafka producer to payments (#12)"
 echo "// tidy" >> "$R1/src/index.ts"
 commit "$R1" 2024-02-15 "fix: tidy whitespace (#13)"
 
-echo '{"name":"app","dependencies":{"moment":"^2.29.0","left-pad":"^1.3.0"}}' > "$R1/package.json"
+printf '{\n  "name": "app",\n  "dependencies": {\n    "moment": "^2.30.0"\n  }\n}\n' > "$R1/package.json"
 commit "$R1" 2024-02-20 "chore: bump dependencies (#14)"
 
 # kafka decision, part 2 (non-adjacent, touches shared bus.ts)
@@ -261,5 +261,41 @@ commit "$R9" 2024-03-02 "extend logger"
 git -C "$R9" checkout -q main
 GIT_AUTHOR_DATE="2024-03-03T12:00:00" GIT_COMMITTER_DATE="2024-03-03T12:00:00" \
   git -C "$R9" merge --no-ff -qm "Merge PR #3: logger" feat/logger
+
+# ---------------------------------------------------------------------------
+# Repo 9: rename fixture — one git mv so parse_log captures old_path.
+# ---------------------------------------------------------------------------
+R9="$OUT/repo_rename"
+init "$R9"
+mkdir -p "$R9/src"
+echo "export const foo = 1;" > "$R9/src/old_name.ts"
+commit "$R9" 2024-01-01 "add old_name"
+git -C "$R9" mv src/old_name.ts src/new_name.ts
+commit "$R9" 2024-01-02 "chore: rename old_name to new_name"
+
+# ---------------------------------------------------------------------------
+# Repo 10: dead-code delete — a single file deleted with no new file added.
+# ---------------------------------------------------------------------------
+R10="$OUT/repo_dead_code_delete"
+init "$R10"
+mkdir -p "$R10/src"
+echo "export const dead = 1;" > "$R10/src/dead.ts"
+commit "$R10" 2024-01-01 "add dead module"
+git -C "$R10" rm -q src/dead.ts
+commit "$R10" 2024-01-02 "chore: remove dead module"
+
+# ---------------------------------------------------------------------------
+# Repo 11: replacement — delete one file, add another in the same commit.
+# ---------------------------------------------------------------------------
+R11="$OUT/repo_replacement"
+init "$R11"
+mkdir -p "$R11/src"
+echo "export const old = 1;" > "$R11/src/old_lib.ts"
+commit "$R11" 2024-01-01 "add old_lib"
+git -C "$R11" rm -q src/old_lib.ts
+# src/ dir still exists (git rm only unstages/deletes the tracked file)
+mkdir -p "$R11/src"
+echo "export const new_ = 1;" > "$R11/src/new_lib.ts"
+commit "$R11" 2024-01-02 "feat: replace old_lib with new_lib"
 
 echo "fixtures built in $OUT"
