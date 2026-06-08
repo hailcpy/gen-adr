@@ -323,6 +323,7 @@ class Candidate:
     title_hint: str
     output_dir: str
     diff_summary: dict = field(default_factory=dict)
+    range: Optional[tuple] = None
 
 
 # --- git helpers -------------------------------------------------------------
@@ -423,15 +424,132 @@ def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
     return "direct-commit"
 
 
-def chunk_commits(commits: list[Commit], strategy: str,
-                  cfg: Config, coupling: Optional[dict] = None,
-                  communities: Optional[dict] = None,
-                  spec: Optional["Specificity"] = None) -> list[list[Commit]]:
-    """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster()."""
-    if strategy in ("squash-boundary", "merge-boundary", "mixed"):
-        return [[c] for c in commits]
-    return _affinity_groups(commits, cfg, coupling=coupling,
-                            communities=communities, spec=spec)
+# git empty-tree hash — safe base for initial commits with no parent
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def enumerate_merge_chunks(
+    repo: str, pathspec: Optional[str]
+) -> list[tuple[str, str, list[Commit]]]:
+    """For each merge commit on the current branch return (merge_sha, base_sha, commits_in_pr).
+
+    For a merge commit M with parents (p1, p2):
+      base = git merge-base p1 p2
+      commits_in_pr = parse_log over base..M with no_merges=True
+
+    Returns chunks in chronological order (earliest merge first).
+    """
+    fmt_args = ["log", "--merges", "--pretty=format:%H|%P|%cd", "--date=short"]
+    if pathspec:
+        fmt_args += ["--", pathspec]
+    raw = git(repo, *fmt_args)
+
+    rows = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha, parents_str, date = line.split("|", 2)
+        parents = parents_str.split()
+        rows.append((date, sha, parents))
+
+    # sort chronologically, tie-break on sha for determinism
+    rows.sort(key=lambda r: (r[0], r[1]))
+
+    result = []
+    for date, merge_sha, parents in rows:
+        if len(parents) < 2:
+            continue
+        p1, p2 = parents[0], parents[1]
+        base_sha = git(repo, "merge-base", p1, p2).strip()
+        pr_commits = parse_log(
+            repo,
+            rev_range=f"{base_sha}..{merge_sha}",
+            pathspec=pathspec,
+            no_merges=True,
+        )
+        result.append((merge_sha, base_sha, pr_commits))
+
+    return result
+
+
+def chunk_commits(
+    commits: list[Commit],
+    strategy: str,
+    cfg: Config,
+    repo: str = "",
+    pathspec: Optional[str] = None,
+    coupling: Optional[dict] = None,
+    communities: Optional[dict] = None,
+    spec: Optional["Specificity"] = None,
+) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]]]:
+    """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster().
+
+    Returns (chunks, chunk_ranges) where chunk_ranges maps chunk index to an
+    optional (base_sha, head_sha) diff range for that chunk.
+    """
+    if strategy == "squash-boundary":
+        chunks = [[c] for c in commits]
+        ranges: dict[int, Optional[tuple[str, str]]] = {}
+        for i, c in enumerate(commits):
+            if c.parents:
+                ranges[i] = (f"{c.sha}^", c.sha)
+            else:
+                ranges[i] = (_EMPTY_TREE, c.sha)
+        return chunks, ranges
+
+    if strategy == "merge-boundary":
+        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        chunks = []
+        ranges = {}
+        seen: set[str] = set()
+        for merge_sha, base_sha, pr_commits in merge_chunks:
+            chunk = []
+            for c in pr_commits:
+                if c.sha not in seen:
+                    seen.add(c.sha)
+                    chunk.append(c)
+            if chunk:
+                idx = len(chunks)
+                chunks.append(chunk)
+                ranges[idx] = (base_sha, merge_sha)
+        return chunks, ranges
+
+    if strategy == "mixed":
+        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        chunks = []
+        ranges = {}
+        seen: set[str] = set()
+        for merge_sha, base_sha, pr_commits in merge_chunks:
+            chunk = []
+            for c in pr_commits:
+                if c.sha not in seen:
+                    seen.add(c.sha)
+                    chunk.append(c)
+            if chunk:
+                idx = len(chunks)
+                chunks.append(chunk)
+                ranges[idx] = (base_sha, merge_sha)
+        # squash-style commits not covered by any merge range
+        for c in commits:
+            if c.sha not in seen:
+                seen.add(c.sha)
+                idx = len(chunks)
+                chunks.append([c])
+                if c.parents:
+                    ranges[idx] = (f"{c.sha}^", c.sha)
+                else:
+                    ranges[idx] = (_EMPTY_TREE, c.sha)
+        return chunks, ranges
+
+    # direct-commit: affinity groups — no clean diff range per group
+    aff_chunks = _affinity_groups(
+        commits, cfg, coupling=coupling, communities=communities, spec=spec
+    )
+    aff_ranges: dict[int, Optional[tuple[str, str]]] = {
+        i: None for i in range(len(aff_chunks))
+    }
+    return aff_chunks, aff_ranges
 
 
 def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
@@ -654,15 +772,22 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
     return sorted(groups.values(), key=lambda g: min(c.date for c in g))
 
 
-def cluster(chunks: list[list[Commit]], cfg: Config,
-            coupling: Optional[dict] = None,
-            communities: Optional[dict] = None,
-            spec: Optional["Specificity"] = None) -> list[list[Commit]]:
+def cluster(
+    chunks: list[list[Commit]],
+    cfg: Config,
+    chunk_ranges: Optional[dict[int, Optional[tuple[str, str]]]] = None,
+    coupling: Optional[dict] = None,
+    communities: Optional[dict] = None,
+    spec: Optional["Specificity"] = None,
+) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
     Merge when ≥2 of 4 signals agree: file overlap, topic-token overlap,
     co-change coupling, Leiden community match. Deterministic. Oversized
     clusters (> cfg.cluster_cap) are split when cfg.split_oversized.
+
+    Returns (clusters, cluster_ranges). A cluster that came from exactly one
+    input chunk inherits that chunk's range; multi-chunk clusters get None.
     """
     m = len(chunks)
     parent = list(range(m))
@@ -694,18 +819,39 @@ def cluster(chunks: list[list[Commit]], cfg: Config,
                 union(i, j)
 
     groups: dict[int, list[Commit]] = {}
+    group_chunk_indices: dict[int, list[int]] = {}
     for idx, chunk in enumerate(chunks):
-        groups.setdefault(find(idx), []).extend(chunk)
+        root = find(idx)
+        groups.setdefault(root, []).extend(chunk)
+        group_chunk_indices.setdefault(root, []).append(idx)
 
     result: list[list[Commit]] = []
-    for g in groups.values():
+    result_ranges: list[Optional[tuple[str, str]]] = []
+    for root, g in groups.items():
         g_sorted = sorted(g, key=lambda c: c.date)
+        src_indices = group_chunk_indices[root]
+        if len(src_indices) == 1 and chunk_ranges is not None:
+            rng = chunk_ranges.get(src_indices[0])
+        else:
+            rng = None
         if cfg.split_oversized and len(g_sorted) > cfg.cluster_cap:
             for start in range(0, len(g_sorted), cfg.cluster_cap):
                 result.append(g_sorted[start:start + cfg.cluster_cap])
+                result_ranges.append(None)
         else:
             result.append(g_sorted)
-    return sorted(result, key=lambda g: min(c.date for c in g))
+            result_ranges.append(rng)
+
+    order = sorted(
+        range(len(result)),
+        key=lambda k: min(c.date for c in result[k]),
+    )
+    ordered_result = [result[k] for k in order]
+    ordered_ranges: dict[int, Optional[tuple[str, str]]] = {
+        new_i: result_ranges[old_k]
+        for new_i, old_k in enumerate(order)
+    }
+    return ordered_result, ordered_ranges
 
 
 def classify(commits: list[Commit], cfg: Config) -> tuple[int, str, list[str]]:
@@ -849,10 +995,16 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         resolve_specificity_caps(cfg, len(commits))
     preflight["specificity_cap"] = cfg.file_df_max
     spec = build_specificity(commits, cfg)
-    chunks = chunk_commits(commits, strategy, cfg, coupling=coupling,
-                           communities=communities, spec=spec)
-    clusters = cluster(chunks, cfg, coupling=coupling,
-                       communities=communities, spec=spec)
+    chunks, chunk_ranges = chunk_commits(
+        commits, strategy, cfg,
+        repo=repo, pathspec=pathspec,
+        coupling=coupling, communities=communities, spec=spec,
+    )
+    clusters, cluster_ranges = cluster(
+        chunks, cfg,
+        chunk_ranges=chunk_ranges,
+        coupling=coupling, communities=communities, spec=spec,
+    )
 
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
@@ -873,6 +1025,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             title_hint=group[0].subject,
             output_dir=out_dir,
             diff_summary=diff_summary(group),
+            range=cluster_ranges.get(i - 1),
         ))
 
     return {

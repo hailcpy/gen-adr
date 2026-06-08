@@ -224,4 +224,42 @@ EOF
 echo '{"name":"app","dependencies":{"pandas":"^2.0.0"}}' > "$R8/requirements.txt"
 commit "$R8" 2024-02-01 "feat: add transform pipeline with pandas (#2)"
 
+# ---------------------------------------------------------------------------
+# Repo 9: real merge-commit PRs (no --squash, no fast-forward). Three PRs each
+# with 2 commits, merged via git merge --no-ff. Gives detect_strategy enough
+# merges (>=3) to return "merge-boundary".
+# ---------------------------------------------------------------------------
+R9="$OUT/repo_merge_pr"
+init "$R9"
+mkdir -p "$R9/src"
+echo "init" > "$R9/README.md"
+commit "$R9" 2024-01-01 "init"
+
+git -C "$R9" checkout -qb feat/cache
+echo "cache" > "$R9/src/cache.ts"
+commit "$R9" 2024-01-10 "add cache"
+echo "more cache" >> "$R9/src/cache.ts"
+commit "$R9" 2024-01-11 "tune cache"
+git -C "$R9" checkout -q main
+GIT_AUTHOR_DATE="2024-01-12T12:00:00" GIT_COMMITTER_DATE="2024-01-12T12:00:00" \
+  git -C "$R9" merge --no-ff -qm "Merge PR #1: cache" feat/cache
+
+git -C "$R9" checkout -qb feat/auth
+echo "auth" > "$R9/src/auth.ts"
+commit "$R9" 2024-02-01 "add auth"
+echo "more auth" >> "$R9/src/auth.ts"
+commit "$R9" 2024-02-02 "harden auth"
+git -C "$R9" checkout -q main
+GIT_AUTHOR_DATE="2024-02-03T12:00:00" GIT_COMMITTER_DATE="2024-02-03T12:00:00" \
+  git -C "$R9" merge --no-ff -qm "Merge PR #2: auth" feat/auth
+
+git -C "$R9" checkout -qb feat/logger
+echo "logger" > "$R9/src/logger.ts"
+commit "$R9" 2024-03-01 "add logger"
+echo "more logger" >> "$R9/src/logger.ts"
+commit "$R9" 2024-03-02 "extend logger"
+git -C "$R9" checkout -q main
+GIT_AUTHOR_DATE="2024-03-03T12:00:00" GIT_COMMITTER_DATE="2024-03-03T12:00:00" \
+  git -C "$R9" merge --no-ff -qm "Merge PR #3: logger" feat/logger
+
 echo "fixtures built in $OUT"
