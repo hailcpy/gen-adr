@@ -339,6 +339,24 @@ def git(repo: str, *args: str) -> str:
     return res.stdout
 
 
+def verify_ref(repo: str, ref: str) -> bool:
+    """True iff `git rev-parse --verify <ref>` succeeds."""
+    res = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
+def is_ancestor(repo: str, ref: str, head: str = "HEAD") -> bool:
+    """True iff `ref` is an ancestor of `head` in the current history."""
+    res = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor", ref, head],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
 def read_diff(repo: str, base: str, head: str, path: str) -> str:
     """git diff <base> <head> -- <path>. Returns raw unified diff text, or '' on error."""
     res = subprocess.run(
@@ -442,7 +460,7 @@ def parse_log(repo: str, rev_range: Optional[str], pathspec: Optional[str],
     if rev_range:
         args.append(rev_range)
     if pathspec:
-        args += ["--", pathspec]
+        args += ["--full-diff", "--", pathspec]
     out = git(repo, *args)
 
     commits: list[Commit] = []
@@ -1050,6 +1068,32 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     rev_range = None
     if history_scope.startswith("since:"):
         ref = history_scope.split(":", 1)[1]
+        if not verify_ref(repo, ref):
+            return {
+                "preflight": {
+                    "shallow": is_shallow(repo),
+                    "output_dir": output_dir_for(code_scope),
+                    "leiden_available": _LEIDEN_AVAILABLE,
+                },
+                "halt": "bad_ref",
+                "halt_detail": f"reference '{ref}' is not a valid commit",
+                "strategy": None,
+                "scope": {"history": history_scope, "code": code_scope},
+                "candidates": [],
+            }
+        if not is_ancestor(repo, ref):
+            return {
+                "preflight": {
+                    "shallow": is_shallow(repo),
+                    "output_dir": output_dir_for(code_scope),
+                    "leiden_available": _LEIDEN_AVAILABLE,
+                },
+                "halt": "ref_not_ancestor",
+                "halt_detail": f"reference '{ref}' is not an ancestor of HEAD",
+                "strategy": None,
+                "scope": {"history": history_scope, "code": code_scope},
+                "candidates": [],
+            }
         rev_range = f"{ref}..HEAD"
 
     out_dir = output_dir_for(code_scope)
