@@ -53,8 +53,22 @@ SECURITY_RE = re.compile(r"(^|/)(auth|certs|secrets)/", re.I)
 INFRA_RE = re.compile(r"(^|/)(Dockerfile|k8s/|\.github/workflows/)", re.I)
 TEST_RE = re.compile(r"(^|/)(tests?|__tests__)/|(_test\.|\.test\.|\.spec\.|_spec\.)", re.I)
 DOCS_RE = re.compile(r"\.(md|rst|txt|adoc)$|(^|/)docs?/", re.I)
-SRC_PATH_RE = re.compile(r"(^|/)(src|lib|core|app|services|internal|pkg)/", re.I)
 PR_REF_RE = re.compile(r"\(#\d+\)")
+
+# legacy hard-coded source roots — always included in detect_source_roots union
+_LEGACY_SOURCE_ROOTS = frozenset({"src", "lib", "core", "app", "services", "internal", "pkg"})
+
+_SOURCE_EXTS = frozenset({
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".rb", ".kt", ".swift",
+    ".cpp", ".c", ".h", ".hpp", ".cs", ".scala", ".lua", ".sh", ".php",
+})
+
+_SOURCE_ROOT_DENY = frozenset({
+    ".git", ".github", "node_modules", "dist", "build", "target", "vendor",
+    "__pycache__", "docs", "doc", "tests", "test", "__tests__",
+    ".venv", "venv", "coverage", ".next", ".nuxt",
+})
 
 # topic-token extraction
 DEFAULT_STOPWORDS = frozenset({
@@ -90,6 +104,58 @@ DEMOTE_PREFIX = re.compile(r"^(fix|chore|style|bump)\b", re.I)
 EXCLUDE_PREFIX = re.compile(r"^(test|docs|lint|format)\b", re.I)
 
 
+# --- source root detection ---------------------------------------------------
+
+def detect_source_roots(repo: str) -> list[str]:
+    """Return a sorted list of top-level dirs in `repo` that contain source code.
+
+    Walks each depth-1 directory (bounded to 200 files) looking for files with
+    a code extension. The result is unioned with the legacy hard-coded set so
+    that existing fixtures keep passing regardless of what is found on disk.
+    Dirs in the deny set (node_modules, dist, .git, …) are skipped entirely.
+    """
+    import os
+    roots: set[str] = set()
+    try:
+        entries = os.listdir(repo)
+    except OSError:
+        return sorted(_LEGACY_SOURCE_ROOTS)
+    for entry in entries:
+        if entry in _SOURCE_ROOT_DENY or entry.startswith("."):
+            continue
+        full = os.path.join(repo, entry)
+        if not os.path.isdir(full):
+            continue
+        # bounded walk: stop after 200 files to avoid scanning huge trees
+        count = 0
+        found = False
+        for dirpath, dirnames, filenames in os.walk(full):
+            # prune deny dirs in-place so os.walk skips them
+            dirnames[:] = [d for d in dirnames if d not in _SOURCE_ROOT_DENY
+                           and not d.startswith(".")]
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in _SOURCE_EXTS:
+                    found = True
+                    break
+                count += 1
+                if count >= 200:
+                    break
+            if found or count >= 200:
+                break
+        if found:
+            roots.add(entry)
+    return sorted(roots | _LEGACY_SOURCE_ROOTS)
+
+
+def _in_source_root(path: str, roots: list[str]) -> bool:
+    """Return True iff `path` lives directly under any of the given `roots`."""
+    for root in roots:
+        if path == root or path.startswith(root + "/"):
+            return True
+    return False
+
+
 # --- config ------------------------------------------------------------------
 
 @dataclass
@@ -102,8 +168,11 @@ class Config:
       score_arch_threshold, score_borderline_threshold,
       stopwords / extra_stopwords,
       generic_basenames / extra_generic_basenames,
+      source_roots / extra_source_roots,
       weights (partial dict, merged over defaults).
     The `extra_*` lists union with the defaults; the bare keys replace them.
+    `source_roots` defaults to None, which triggers auto-detection at analyze()
+    time via detect_source_roots().
     """
     # clustering
     min_dir_depth: int = 2          # dir prefixes shorter than this don't bind
@@ -131,6 +200,9 @@ class Config:
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
+    # source root detection
+    source_roots: Optional[list] = None  # None = auto-detect at analyze() time
+    extra_source_roots: list = field(default_factory=list)  # always unioned in
     # token vocabularies
     stopwords: frozenset = DEFAULT_STOPWORDS
     generic_basenames: frozenset = DEFAULT_GENERIC_BASENAMES
@@ -159,6 +231,10 @@ class Config:
             cfg.generic_basenames = (
                 cfg.generic_basenames | frozenset(raw["extra_generic_basenames"])
             )
+        if "source_roots" in raw:
+            cfg.source_roots = sorted(raw["source_roots"])
+        if "extra_source_roots" in raw:
+            cfg.extra_source_roots = list(raw["extra_source_roots"])
         if "weights" in raw:
             cfg.weights = {**cfg.weights, **raw["weights"]}
         return cfg
@@ -650,7 +726,8 @@ def classify(commits: list[Commit], cfg: Config) -> tuple[int, str, list[str]]:
                        f"cap {cfg.cluster_cap})")
 
     new_src = [f for f in files if f.status.startswith("A")
-               and SRC_PATH_RE.search(f.path) and not TEST_RE.search(f.path)]
+               and _in_source_root(f.path, cfg.source_roots or [])
+               and not TEST_RE.search(f.path)]
     if new_src:
         score += w["new_src"]
         signals.append("new source files added")
@@ -756,6 +833,12 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     if preflight["shallow"]:
         return {"preflight": preflight, "halt": "shallow_clone",
                 "strategy": None, "candidates": []}
+
+    if cfg.source_roots is None:
+        cfg.source_roots = detect_source_roots(repo)
+    if cfg.extra_source_roots:
+        cfg.source_roots = sorted(set(cfg.source_roots) | set(cfg.extra_source_roots))
+    preflight["source_roots"] = cfg.source_roots
 
     strategy = detect_strategy(repo, pathspec)
     commits = parse_log(repo, rev_range, pathspec)

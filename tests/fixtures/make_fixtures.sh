@@ -205,4 +205,23 @@ hot 2024-01-08 gamma "feat: add gamma endpoint (#8)"
 hot 2024-01-09 gamma "fix: gamma endpoint caching (#9)"
 hot 2024-01-10 gamma "feat: extend gamma endpoint (#10)"
 
+# ---------------------------------------------------------------------------
+# Repo 8: product code lives under scripts/ (not src/lib/etc.).
+# Tests that detect_source_roots picks up the non-legacy layout so that
+# adding files under scripts/ triggers the new_src signal.
+# ---------------------------------------------------------------------------
+R8="$OUT/repo_scripts_layout"
+init "$R8"
+mkdir -p "$R8/scripts"
+echo '#!/usr/bin/env python3' > "$R8/scripts/run.py"
+commit "$R8" 2024-01-01 "chore: initial scaffold (#1)"
+# Add a new source file under scripts/ — this is the decision we want detected
+mkdir -p "$R8/scripts/pipeline"
+cat > "$R8/scripts/pipeline/transform.py" <<'EOF'
+"""Data transform step."""
+def transform(data): return data
+EOF
+echo '{"name":"app","dependencies":{"pandas":"^2.0.0"}}' > "$R8/requirements.txt"
+commit "$R8" 2024-02-01 "feat: add transform pipeline with pandas (#2)"
+
 echo "fixtures built in $OUT"
