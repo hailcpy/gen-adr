@@ -246,6 +246,7 @@ class Config:
 class FileChange:
     status: str  # A, M, D, R...
     path: str
+    old_path: Optional[str] = None
 
 
 @dataclass
@@ -338,6 +339,66 @@ def git(repo: str, *args: str) -> str:
     return res.stdout
 
 
+def read_diff(repo: str, base: str, head: str, path: str) -> str:
+    """git diff <base> <head> -- <path>. Returns raw unified diff text, or '' on error."""
+    res = subprocess.run(
+        ["git", "-C", repo, "diff", base, head, "--", path],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return ""
+    return res.stdout
+
+
+_VERSION_LINE_PATTERNS = [
+    re.compile(r'^[+-]\s*"[^"]+":\s*"[~^]?\d+(\.\d+){0,2}(-[\w.]+)?"\s*,?\s*$'),
+    re.compile(r'^[+-]\s*[\w_-]+\s*=\s*"[~^>=<]?\s*\d+(\.\d+){0,2}(-[\w.]+)?"\s*$'),
+    re.compile(r'^[+-]\s*[\w_-]+\s*[=<>!~]+\s*\d+(\.\d+){0,2}\s*$'),
+    re.compile(r'^[+-]\s*[\w./_-]+\s+v\d+(\.\d+){0,2}\s*$'),
+]
+# captures the package name from a version line (group 1), one per manifest shape
+_VERSION_KEY_PATTERNS = [
+    re.compile(r'^[+-]\s*"([^"]+)":\s*"[~^>=<]?[\d]'),         # package.json
+    re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*=\s*"[~^>=<]?\d'),  # pyproject/cargo TOML
+    re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*[=<>!~]+\s*\d'),    # requirements.txt
+    re.compile(r'^[+-]\s*([\w./_-]+)\s+v\d'),                    # go.mod
+]
+
+
+def is_pure_version_bump(repo: str, base: str, head: str, manifest_paths: list) -> bool:
+    """True iff every +/- line in the given manifest files is a version-literal change.
+
+    Also verifies that no package name is added or removed — only version values change.
+    """
+    saw_any = False
+    for path in manifest_paths:
+        diff_text = read_diff(repo, base, head, path)
+        if not diff_text:
+            return False
+        removed_keys: set = set()
+        added_keys: set = set()
+        for line in diff_text.splitlines():
+            if line.startswith(("diff --git", "index ", "+++", "---", "@@")):
+                continue
+            if not line or line[0] not in ("+", "-"):
+                continue
+            saw_any = True
+            if not any(pat.match(line) for pat in _VERSION_LINE_PATTERNS):
+                return False
+            for kp in _VERSION_KEY_PATTERNS:
+                m = kp.match(line)
+                if m:
+                    if line[0] == "-":
+                        removed_keys.add(m.group(1))
+                    else:
+                        added_keys.add(m.group(1))
+                    break
+        # a dep was renamed/replaced (key set changed) → not a pure bump
+        if removed_keys != added_keys:
+            return False
+    return saw_any
+
+
 def is_shallow(repo: str) -> bool:
     return git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
 
@@ -398,9 +459,13 @@ def parse_log(repo: str, rev_range: Optional[str], pathspec: Optional[str],
         elif line.strip() and current is not None:
             parts = line.split("\t")
             status = parts[0]
-            # rename: "R100\told\tnew" -> treat new path as modify
-            path = parts[-1]
-            current.files.append(FileChange(status=status, path=path))
+            if status[0] in ("R", "C") and len(parts) >= 3:
+                old_path = parts[1]
+                path = parts[2]
+                current.files.append(FileChange(status=status, path=path, old_path=old_path))
+            else:
+                path = parts[-1]
+                current.files.append(FileChange(status=status, path=path))
     return commits
 
 
@@ -649,10 +714,13 @@ def diff_summary(group: list[Commit]) -> dict:
     added: set[str] = set()
     deleted: set[str] = set()
     modified: set[str] = set()
+    renamed: list[tuple[str, str]] = []
     for c in group:
         for f in c.files:
             if f.status.startswith(("A", "R", "C")):
                 added.add(f.path)
+                if f.status[0] in ("R", "C") and f.old_path:
+                    renamed.append((f.old_path, f.path))
             elif f.status.startswith("D"):
                 deleted.add(f.path)
             else:
@@ -663,7 +731,7 @@ def diff_summary(group: list[Commit]) -> dict:
         s = sorted(paths)
         return s if len(s) <= n else s[:n] + [f"... +{len(s) - n} more"]
 
-    return {
+    result: dict = {
         "summary": f"+{len(added)} added, -{len(deleted)} deleted, "
                    f"{len(modified)} modified",
         "added": cap(added, 8),
@@ -671,6 +739,9 @@ def diff_summary(group: list[Commit]) -> dict:
         "modified_count": len(modified),
         "modified_top": cap(modified, 5),
     }
+    if renamed:
+        result["renamed"] = sorted(renamed)
+    return result
 
 
 def build_specificity(commits: list[Commit], cfg: Config) -> Optional[Specificity]:
@@ -854,7 +925,12 @@ def cluster(
     return ordered_result, ordered_ranges
 
 
-def classify(commits: list[Commit], cfg: Config) -> tuple[int, str, list[str]]:
+def classify(
+    commits: list[Commit],
+    cfg: Config,
+    repo: Optional[str] = None,
+    chunk_range: Optional[tuple] = None,
+) -> tuple[int, str, list[str]]:
     """Diff-first scoring over the aggregated candidate. Returns (score, class, signals)."""
     files = [f for c in commits for f in c.files]
     paths = [f.path for f in files]
@@ -891,9 +967,13 @@ def classify(commits: list[Commit], cfg: Config) -> tuple[int, str, list[str]]:
         score += w["breadth"]
         signals.append(">5 files across >=2 dirs")
 
-    if any(f.status.startswith("D") for f in files):
+    has_deletion = any(f.status.startswith("D") for f in files)
+    has_addition = any(f.status[0] in ("A", "R", "C") for f in files)
+    if has_deletion and has_addition:
         score += w["deletion"]
-        signals.append("file deleted (replacement pattern)")
+        signals.append("file deleted with correlated addition (replacement pattern)")
+    elif has_deletion:
+        signals.append("file deleted (no replacement — likely dead code)")
 
     if REPLACE_WORDS.search(subjects):
         score += w["replace_verb"]
@@ -931,8 +1011,14 @@ def classify(commits: list[Commit], cfg: Config) -> tuple[int, str, list[str]]:
         signals.append("FORCE_EXCLUDE: docs only")
         return score, "skip", signals
     if only_dep_bump:
-        signals.append("FORCE_EXCLUDE: version bump only")
-        return score, "skip", signals
+        if repo and chunk_range:
+            base, head = chunk_range
+            confirmed = is_pure_version_bump(repo, base, head, dep_changed)
+        else:
+            confirmed = True
+        if confirmed:
+            signals.append("FORCE_EXCLUDE: version bump only")
+            return score, "skip", signals
 
     if score >= cfg.score_arch_threshold:
         cls = "architectural"
@@ -1008,7 +1094,9 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
 
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
-        score, cls, signals = classify(group, cfg)
+        score, cls, signals = classify(
+            group, cfg, repo=repo, chunk_range=cluster_ranges.get(i - 1)
+        )
         all_files = sorted({f.path for c in group for f in c.files})
         dirs = sorted({d for c in group for d in c.top_dirs if d})
         toks = sorted({t for c in group for t in c.topic_tokens(cfg)})
