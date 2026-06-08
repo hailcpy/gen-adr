@@ -36,7 +36,7 @@ def test_split_oversized_off_keeps_one_group():
     # group must stay intact and carry the WARN signal.
     chunks = [commits]
     chunk_ranges = {0: None}
-    clusters, cluster_ranges, split_reasons = analyze.cluster(
+    clusters, cluster_ranges, split_reasons, merge_reasons = analyze.cluster(
         chunks, cfg, chunk_ranges=chunk_ranges,
     )
     assert len(clusters) == 1

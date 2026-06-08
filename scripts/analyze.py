@@ -40,6 +40,20 @@ except ImportError:
 COUPLING_MIN_SHARED = 5   # Tornhill's empirical minimums from code-maat
 COUPLING_MIN_SCORE  = 0.30
 
+# Lockfiles, generated code, and vendored trees co-change with everything and
+# contribute no real coupling signal — they just blow up the O(k^2) pair count
+# for giant refactor commits. Drop them before pair enumeration.
+_COUPLING_DENY_RE = re.compile(
+    r"\.(lock|min\.js|min\.css|map|generated\..*|pb\.go|pb\.py)$"
+    r"|(^|/)(node_modules|vendor|dist|build|\.next|\.nuxt|target|coverage)/"
+    r"|(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|poetry\.lock|cargo\.lock|gemfile\.lock|composer\.lock)$",
+    re.I,
+)
+# A commit touching more files than this after filtering is a large refactor
+# or merge dump — its co-change signal is unreliable, so skip pair enumeration
+# for it entirely rather than pay O(k^2).
+_MAX_COUPLING_FILES_PER_COMMIT = 200
+
 # auto-tuned edge specificity (see Config.auto_specificity)
 AUTO_SPEC_MIN_COMMITS = 50   # below this, hotness isn't meaningful → no-op
 AUTO_SPEC_DIVISOR     = 50   # cap = max(3, commit_count // divisor)
@@ -325,6 +339,7 @@ class Candidate:
     output_dir: str
     diff_summary: dict = field(default_factory=dict)
     range: Optional[tuple] = None
+    merge_reasons: list = field(default_factory=list)
 
 
 # --- git helpers -------------------------------------------------------------
@@ -650,6 +665,9 @@ def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
         paths = list({f.path for f in c.files})
         for p in paths:
             file_revs[p] = file_revs.get(p, 0) + 1
+        paths = [p for p in paths if not _COUPLING_DENY_RE.search(p)]
+        if len(paths) > _MAX_COUPLING_FILES_PER_COMMIT:
+            continue
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
                 key = frozenset({paths[i], paths[j]})
@@ -826,6 +844,137 @@ def _shares(a_dirs: set[str], b_dirs: set[str], a_tok: set[str], b_tok: set[str]
     return sum([file_overlap, topic_overlap, coupled, community_match]) >= 2
 
 
+def _shares_with_reasons(a_dirs: set[str], b_dirs: set[str], a_tok: set[str],
+                         b_tok: set[str], a_paths: set[str], b_paths: set[str],
+                         coupling: Optional[dict] = None,
+                         communities: Optional[dict] = None,
+                         spec: Optional["Specificity"] = None,
+                         ) -> tuple[bool, list[str]]:
+    """Same merge decision as `_shares`, plus a short human-readable list of
+    which sub-signals fired — surfaced on `Candidate.merge_reasons` so the
+    skill can explain *why* commits were grouped together.
+
+    Returns (matched, reasons). `reasons` has at most 4 entries, one per
+    signal, in signal order: file, token, coupled, community.
+    """
+    shared_files = a_paths & b_paths
+    shared_toks  = a_tok & b_tok
+    shared_dirs  = a_dirs & b_dirs
+    if spec is not None:
+        shared_files = spec.specific_files(shared_files)
+        shared_toks  = spec.specific_tokens(shared_toks)
+        shared_dirs  = spec.specific_dirs(shared_dirs)
+    file_overlap  = bool(shared_files) or bool(shared_dirs)
+    topic_overlap = bool(shared_toks)
+    coupled       = _coupled(a_paths, b_paths, coupling) if coupling else False
+    community_match = (
+        not file_overlap
+        and communities is not None
+        and commits_share_community(a_paths, b_paths, communities)
+    )
+    matched = sum([file_overlap, topic_overlap, coupled, community_match]) >= 2
+    if not matched:
+        return False, []
+
+    reasons: list[str] = []
+    if shared_files:
+        reasons.append(f"file:{sorted(shared_files)[0]}")
+    elif shared_dirs:
+        reasons.append(f"dir:{sorted(shared_dirs)[0]}")
+    if topic_overlap:
+        reasons.append(f"token:{sorted(shared_toks)[0]}")
+    if coupled:
+        reasons.append("coupled")
+    if community_match:
+        reasons.append("community")
+    return True, reasons
+
+
+def _candidate_pairs(aggs: list[tuple[set[str], set[str], set[str]]],
+                     cfg: Config,
+                     spec: Optional["Specificity"] = None,
+                     communities: Optional[dict] = None,
+                     coupling: Optional[dict] = None,
+                     ) -> set[tuple[int, int]]:
+    """Build the set of index pairs worth running `_shares` on, via inverted
+    indexes over the aggregated entities (chunks for `cluster`, commits for
+    `_affinity_groups`).
+
+    Each `aggs[i]` is `(dirs, tokens, paths)`. Replaces the exhaustive
+    O(n^2) double loop: instead of scoring every pair, only pairs that share
+    at least one file, token, dir, community, or known coupling edge are
+    scored at all. DF-capped keys (per `spec`) are dropped *before* pair
+    generation — that's what keeps hot files from generating quadratic
+    candidates.
+
+    A fifth index, built from `coupling` itself, recovers coupling-only edges
+    (no shared file/token/dir/community) that the first four indexes would
+    otherwise miss, preserving `_shares`'s recall.
+    """
+    file_to_idx: dict[str, list[int]] = {}
+    token_to_idx: dict[str, list[int]] = {}
+    dir_to_idx: dict[str, list[int]] = {}
+    community_to_idx: dict[int, list[int]] = {}
+
+    for idx, (dirs, toks, paths) in enumerate(aggs):
+        for p in paths:
+            file_to_idx.setdefault(p, []).append(idx)
+        for t in toks:
+            token_to_idx.setdefault(t, []).append(idx)
+        for d in dirs:
+            dir_to_idx.setdefault(d, []).append(idx)
+        if communities is not None:
+            for p in paths:
+                cid = communities.get(p)
+                if cid is not None:
+                    community_to_idx.setdefault(cid, []).append(idx)
+
+    if spec is not None:
+        if spec.file_df_max is not None:
+            file_to_idx = {k: v for k, v in file_to_idx.items()
+                           if spec.fdf.get(k, 0) <= spec.file_df_max}
+        if spec.token_df_max is not None:
+            token_to_idx = {k: v for k, v in token_to_idx.items()
+                            if spec.tdf.get(k, 0) <= spec.token_df_max}
+        if spec.dir_df_max is not None:
+            dir_to_idx = {k: v for k, v in dir_to_idx.items()
+                          if spec.ddf.get(k, 0) <= spec.dir_df_max}
+
+    pairs: set[tuple[int, int]] = set()
+
+    def _emit(index: dict) -> None:
+        for key in sorted(index.keys()):
+            members = index[key]
+            if len(members) < 2:
+                continue
+            for a in range(len(members)):
+                for b in range(a + 1, len(members)):
+                    i, j = members[a], members[b]
+                    pairs.add((i, j) if i < j else (j, i))
+
+    _emit(file_to_idx)
+    _emit(token_to_idx)
+    _emit(dir_to_idx)
+    if communities is not None:
+        _emit(community_to_idx)
+
+    if coupling:
+        for key in sorted(coupling.keys(), key=lambda fs: sorted(fs)):
+            score = coupling[key]
+            if score < COUPLING_MIN_SCORE:
+                continue
+            path_a, path_b = sorted(key)
+            members_a = file_to_idx.get(path_a, [])
+            members_b = file_to_idx.get(path_b, [])
+            for i in members_a:
+                for j in members_b:
+                    if i == j:
+                        continue
+                    pairs.add((i, j) if i < j else (j, i))
+
+    return pairs
+
+
 def _affinity_groups(commits: list[Commit], cfg: Config,
                      coupling: Optional[dict] = None,
                      communities: Optional[dict] = None,
@@ -842,17 +991,15 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
     def union(i: int, j: int) -> None:
         parent[find(i)] = find(j)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            if _shares(
-                commits[i].dirs_deep(cfg), commits[j].dirs_deep(cfg),
-                commits[i].topic_tokens(cfg), commits[j].topic_tokens(cfg),
-                commits[i].paths, commits[j].paths,
-                coupling=coupling,
-                communities=communities,
-                spec=spec,
-            ):
-                union(i, j)
+    aggs = [(c.dirs_deep(cfg), c.topic_tokens(cfg), c.paths) for c in commits]
+    candidate_pairs = _candidate_pairs(aggs, cfg, spec=spec,
+                                       communities=communities, coupling=coupling)
+    for (i, j) in candidate_pairs:
+        di, ti, pi = aggs[i]
+        dj, tj, pj = aggs[j]
+        if _shares(di, dj, ti, tj, pi, pj, coupling=coupling,
+                   communities=communities, spec=spec):
+            union(i, j)
 
     groups: dict[int, list[Commit]] = {}
     for i, c in enumerate(commits):
@@ -968,7 +1115,7 @@ def cluster(
     communities: Optional[dict] = None,
     spec: Optional["Specificity"] = None,
 ) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]],
-           dict[int, Optional[str]]]:
+           dict[int, Optional[str]], dict[int, list[str]]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
     Merge when ≥2 of 4 signals agree: file overlap, topic-token overlap,
@@ -978,10 +1125,19 @@ def cluster(
     date-window slice — so a cohesive decision isn't cut in half just because
     its commits share a date window.
 
-    Returns (clusters, cluster_ranges, cluster_split_reasons). A cluster that
-    came from exactly one input chunk inherits that chunk's range; multi-chunk
-    clusters get None. `cluster_split_reasons[i]` is a human-readable reason
-    string when cluster i was produced by the oversized-split, else None.
+    Candidate pairs worth scoring are drawn from inverted indexes
+    (`_candidate_pairs`) rather than the full O(m^2) cross product — this is
+    what keeps clustering tractable on large histories. Each merge records
+    *why* it fired (`_shares_with_reasons`), surfaced as `cluster_merge_reasons`.
+
+    Returns (clusters, cluster_ranges, cluster_split_reasons,
+    cluster_merge_reasons). A cluster that came from exactly one input chunk
+    inherits that chunk's range; multi-chunk clusters get None.
+    `cluster_split_reasons[i]` is a human-readable reason string when cluster i
+    was produced by the oversized-split, else None. `cluster_merge_reasons[i]`
+    is a list of up to 8 short strings (e.g. `"file:lib/bus.ts"`, `"token:kafka"`,
+    `"coupled"`, `"community"`) explaining which signals bound the cluster
+    together; split sub-clusters inherit their parent's reasons.
     """
     m = len(chunks)
     parent = list(range(m))
@@ -1004,13 +1160,27 @@ def cluster(
         return dirs, toks, paths
 
     aggs = [agg(ch) for ch in chunks]
-    for i in range(m):
-        for j in range(i + 1, m):
-            di, ti, pi = aggs[i]
-            dj, tj, pj = aggs[j]
-            if _shares(di, dj, ti, tj, pi, pj, coupling=coupling,
-                       communities=communities, spec=spec):
-                union(i, j)
+    candidate_pairs = _candidate_pairs(aggs, cfg, spec=spec,
+                                       communities=communities, coupling=coupling)
+    merge_reasons: dict[int, list[str]] = {}
+    for (i, j) in candidate_pairs:
+        di, ti, pi = aggs[i]
+        dj, tj, pj = aggs[j]
+        matched, reasons = _shares_with_reasons(di, dj, ti, tj, pi, pj,
+                                                 coupling=coupling,
+                                                 communities=communities, spec=spec)
+        if matched:
+            union(i, j)
+            root = find(i)
+            bucket = merge_reasons.setdefault(root, [])
+            for r in reasons:
+                if r not in bucket and len(bucket) < 8:
+                    bucket.append(r)
+
+    cluster_reasons: dict[int, list[str]] = {}
+    for chunk_idx in range(m):
+        root = find(chunk_idx)
+        cluster_reasons.setdefault(root, merge_reasons.get(root, []))
 
     groups: dict[int, list[Commit]] = {}
     group_chunk_indices: dict[int, list[int]] = {}
@@ -1022,6 +1192,7 @@ def cluster(
     result: list[list[Commit]] = []
     result_ranges: list[Optional[tuple[str, str]]] = []
     result_split_reasons: list[Optional[str]] = []
+    result_merge_reasons: list[list[str]] = []
     for root, g in groups.items():
         g_sorted = sorted(g, key=lambda c: c.date)
         src_indices = group_chunk_indices[root]
@@ -1029,16 +1200,19 @@ def cluster(
             rng = chunk_ranges.get(src_indices[0])
         else:
             rng = None
+        reasons_for_root = cluster_reasons.get(root, [])
         if cfg.split_oversized and len(g_sorted) > cfg.cluster_cap:
             sub_clusters, reasons = _split_oversized(g_sorted, cfg, spec)
             for sg, reason in zip(sub_clusters, reasons):
                 result.append(sg)
                 result_ranges.append(None)  # split sub-clusters lose their range
                 result_split_reasons.append(reason)
+                result_merge_reasons.append(reasons_for_root)
         else:
             result.append(g_sorted)
             result_ranges.append(rng)
             result_split_reasons.append(None)
+            result_merge_reasons.append(reasons_for_root)
 
     order = sorted(
         range(len(result)),
@@ -1053,7 +1227,11 @@ def cluster(
         new_i: result_split_reasons[old_k]
         for new_i, old_k in enumerate(order)
     }
-    return ordered_result, ordered_ranges, ordered_split_reasons
+    ordered_merge_reasons: dict[int, list[str]] = {
+        new_i: result_merge_reasons[old_k]
+        for new_i, old_k in enumerate(order)
+    }
+    return ordered_result, ordered_ranges, ordered_split_reasons, ordered_merge_reasons
 
 
 def classify(
@@ -1246,7 +1424,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         repo=repo, pathspec=pathspec,
         coupling=coupling, communities=communities, spec=spec,
     )
-    clusters, cluster_ranges, cluster_split_reasons = cluster(
+    clusters, cluster_ranges, cluster_split_reasons, cluster_merge_reasons = cluster(
         chunks, cfg,
         chunk_ranges=chunk_ranges,
         coupling=coupling, communities=communities, spec=spec,
@@ -1275,6 +1453,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             output_dir=out_dir,
             diff_summary=diff_summary(group),
             range=cluster_ranges.get(i - 1),
+            merge_reasons=cluster_merge_reasons.get(i - 1, []),
         ))
 
     return {
