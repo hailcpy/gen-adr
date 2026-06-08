@@ -356,8 +356,13 @@ _VERSION_LINE_PATTERNS = [
     re.compile(r'^[+-]\s*[\w_-]+\s*[=<>!~]+\s*\d+(\.\d+){0,2}\s*$'),
     re.compile(r'^[+-]\s*[\w./_-]+\s+v\d+(\.\d+){0,2}\s*$'),
 ]
-# captures the package name from a version line (group 1)
-_VERSION_KEY_RE = re.compile(r'^[+-]\s*"([^"]+)":\s*"[~^>=<]?[\d]')
+# captures the package name from a version line (group 1), one per manifest shape
+_VERSION_KEY_PATTERNS = [
+    re.compile(r'^[+-]\s*"([^"]+)":\s*"[~^>=<]?[\d]'),         # package.json
+    re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*=\s*"[~^>=<]?\d'),  # pyproject/cargo TOML
+    re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*[=<>!~]+\s*\d'),    # requirements.txt
+    re.compile(r'^[+-]\s*([\w./_-]+)\s+v\d'),                    # go.mod
+]
 
 
 def is_pure_version_bump(repo: str, base: str, head: str, manifest_paths: list) -> bool:
@@ -380,12 +385,14 @@ def is_pure_version_bump(repo: str, base: str, head: str, manifest_paths: list) 
             saw_any = True
             if not any(pat.match(line) for pat in _VERSION_LINE_PATTERNS):
                 return False
-            m = _VERSION_KEY_RE.match(line)
-            if m:
-                if line[0] == "-":
-                    removed_keys.add(m.group(1))
-                else:
-                    added_keys.add(m.group(1))
+            for kp in _VERSION_KEY_PATTERNS:
+                m = kp.match(line)
+                if m:
+                    if line[0] == "-":
+                        removed_keys.add(m.group(1))
+                    else:
+                        added_keys.add(m.group(1))
+                    break
         # a dep was renamed/replaced (key set changed) → not a pure bump
         if removed_keys != added_keys:
             return False

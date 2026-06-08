@@ -124,6 +124,27 @@ def test_is_pure_version_bump_true_for_pyproject():
         assert analyze.is_pure_version_bump(tmp, base, head, ["pyproject.toml"])
 
 
+def test_is_pure_version_bump_false_for_pyproject_swap():
+    """TOML dependency swap (different package keys) must NOT be reported as a pure bump.
+
+    Regression for codex review on issue #4 — key extraction previously only
+    handled JSON, so a TOML swap had empty key sets on both sides and passed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[tool.poetry.dependencies]\nmoment = "^2.29.0"\n')
+        _commit(tmp, "init", "2024-01-01")
+        base = _head(tmp)
+
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[tool.poetry.dependencies]\ndate-fns = "^2.30.0"\n')
+        _commit(tmp, "chore: swap moment for date-fns", "2024-01-02")
+        head = _head(tmp)
+
+        assert not analyze.is_pure_version_bump(tmp, base, head, ["pyproject.toml"])
+
+
 # ---------------------------------------------------------------------------
 # Gap B — classify skips / keeps based on diff content
 # ---------------------------------------------------------------------------
