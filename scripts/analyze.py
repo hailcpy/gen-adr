@@ -861,6 +861,105 @@ def _affinity_groups(commits: list[Commit], cfg: Config,
     return sorted(groups.values(), key=lambda g: min(c.date for c in g))
 
 
+def _overlap_score(a: Commit, b: Commit, cfg: Config,
+                   spec: Optional["Specificity"]) -> float:
+    """Pairwise overlap density used by `_split_oversized` to peel cohesive
+    sub-clusters out of an oversized cluster.
+
+    overlap(a, b) = |specific shared files| + 0.5 * |specific shared topic tokens|
+
+    With `spec` given, 'hot' files/tokens (high document-frequency) are filtered
+    out exactly as `_shares` does, so ubiquitous paths don't drive the split.
+    Without `spec`, falls back to plain set-intersection size.
+    """
+    shared_files = a.paths & b.paths
+    shared_toks = a.topic_tokens(cfg) & b.topic_tokens(cfg)
+    if spec is not None:
+        shared_files = spec.specific_files(shared_files)
+        shared_toks = spec.specific_tokens(shared_toks)
+    return len(shared_files) + 0.5 * len(shared_toks)
+
+
+def _split_oversized(commits: list[Commit], cfg: Config,
+                     spec: Optional["Specificity"]) -> tuple[list[list[Commit]], list[str]]:
+    """Greedy overlap-density peel: split an oversized cluster into sub-clusters
+    that stay <= cfg.cluster_cap without cutting cohesive decisions in half.
+
+    Unlike a naive date-window slice, this groups commits by *shared signal*
+    (specific files / topic tokens), so a cohesive change that happens to span
+    the cap isn't sliced apart just because of commit ordering.
+
+    Algorithm (deterministic — every tie breaks on (date, sha)):
+      1. Score every pair (i, j) by `_overlap_score`.
+      2. Seed = commit with the highest total overlap against all others.
+      3. Greedily add the remaining commit with the highest total overlap
+         against the current group, until the group hits the cap or no
+         remaining commit overlaps the group at all.
+      4. Recurse on what's left. Commits with no overlap to anything become
+         their own one-commit groups — singletons are real outliers, not a
+         sign to keep merging.
+
+    Returns (sub_clusters, reasons) — `reasons[i]` describes how sub_clusters[i]
+    was produced, for surfacing as an INFO signal in `classify`.
+    """
+    SPLIT_REASON = "split from oversized cluster (overlap-density peel)"
+
+    n = len(commits)
+    pair_score: dict[tuple[int, int], float] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = _overlap_score(commits[i], commits[j], cfg, spec)
+            if s > 0:
+                pair_score[(i, j)] = s
+
+    def score(i: int, j: int) -> float:
+        if i == j:
+            return 0.0
+        key = (i, j) if i < j else (j, i)
+        return pair_score.get(key, 0.0)
+
+    def sort_key(idx: int):
+        c = commits[idx]
+        return (c.date, c.sha)
+
+    remaining = list(range(n))
+    groups: list[list[int]] = []
+
+    while remaining:
+        # seed: highest total overlap against all other remaining commits
+        totals = {i: sum(score(i, j) for j in remaining if j != i) for i in remaining}
+        max_total = max(totals.values())
+        if max_total <= 0:
+            # no overlap left among remaining commits — each becomes a singleton
+            for i in sorted(remaining, key=sort_key):
+                groups.append([i])
+            remaining = []
+            break
+
+        seed = min((i for i in remaining if totals[i] == max_total), key=sort_key)
+        group = [seed]
+        pool = [i for i in remaining if i != seed]
+
+        while pool and len(group) < cfg.cluster_cap:
+            cand_totals = {i: sum(score(i, g) for g in group) for i in pool}
+            best = max(cand_totals.values())
+            if best <= 0:
+                break
+            pick = min((i for i in pool if cand_totals[i] == best), key=sort_key)
+            group.append(pick)
+            pool.remove(pick)
+
+        groups.append(group)
+        remaining = pool
+
+    sub_clusters = [
+        sorted((commits[i] for i in g), key=lambda c: (c.date, c.sha))
+        for g in groups
+    ]
+    reasons = [SPLIT_REASON for _ in sub_clusters]
+    return sub_clusters, reasons
+
+
 def cluster(
     chunks: list[list[Commit]],
     cfg: Config,
@@ -868,15 +967,21 @@ def cluster(
     coupling: Optional[dict] = None,
     communities: Optional[dict] = None,
     spec: Optional["Specificity"] = None,
-) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]]]:
+) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]],
+           dict[int, Optional[str]]]:
     """Step 2.5: merge related chunks ACROSS boundaries (may be non-adjacent).
 
     Merge when ≥2 of 4 signals agree: file overlap, topic-token overlap,
     co-change coupling, Leiden community match. Deterministic. Oversized
-    clusters (> cfg.cluster_cap) are split when cfg.split_oversized.
+    clusters (> cfg.cluster_cap) are split when cfg.split_oversized, via a
+    greedy overlap-density peel (`_split_oversized`) rather than a naive
+    date-window slice — so a cohesive decision isn't cut in half just because
+    its commits share a date window.
 
-    Returns (clusters, cluster_ranges). A cluster that came from exactly one
-    input chunk inherits that chunk's range; multi-chunk clusters get None.
+    Returns (clusters, cluster_ranges, cluster_split_reasons). A cluster that
+    came from exactly one input chunk inherits that chunk's range; multi-chunk
+    clusters get None. `cluster_split_reasons[i]` is a human-readable reason
+    string when cluster i was produced by the oversized-split, else None.
     """
     m = len(chunks)
     parent = list(range(m))
@@ -916,6 +1021,7 @@ def cluster(
 
     result: list[list[Commit]] = []
     result_ranges: list[Optional[tuple[str, str]]] = []
+    result_split_reasons: list[Optional[str]] = []
     for root, g in groups.items():
         g_sorted = sorted(g, key=lambda c: c.date)
         src_indices = group_chunk_indices[root]
@@ -924,12 +1030,15 @@ def cluster(
         else:
             rng = None
         if cfg.split_oversized and len(g_sorted) > cfg.cluster_cap:
-            for start in range(0, len(g_sorted), cfg.cluster_cap):
-                result.append(g_sorted[start:start + cfg.cluster_cap])
-                result_ranges.append(None)
+            sub_clusters, reasons = _split_oversized(g_sorted, cfg, spec)
+            for sg, reason in zip(sub_clusters, reasons):
+                result.append(sg)
+                result_ranges.append(None)  # split sub-clusters lose their range
+                result_split_reasons.append(reason)
         else:
             result.append(g_sorted)
             result_ranges.append(rng)
+            result_split_reasons.append(None)
 
     order = sorted(
         range(len(result)),
@@ -940,7 +1049,11 @@ def cluster(
         new_i: result_ranges[old_k]
         for new_i, old_k in enumerate(order)
     }
-    return ordered_result, ordered_ranges
+    ordered_split_reasons: dict[int, Optional[str]] = {
+        new_i: result_split_reasons[old_k]
+        for new_i, old_k in enumerate(order)
+    }
+    return ordered_result, ordered_ranges, ordered_split_reasons
 
 
 def classify(
@@ -948,6 +1061,7 @@ def classify(
     cfg: Config,
     repo: Optional[str] = None,
     chunk_range: Optional[tuple] = None,
+    split_reason: Optional[str] = None,
 ) -> tuple[int, str, list[str]]:
     """Diff-first scoring over the aggregated candidate. Returns (score, class, signals)."""
     files = [f for c in commits for f in c.files]
@@ -964,6 +1078,8 @@ def classify(
     if len(commits) > cfg.cluster_cap:
         signals.append(f"WARN: oversized cluster ({len(commits)} commits > "
                        f"cap {cfg.cluster_cap})")
+    if split_reason:
+        signals.append(f"INFO: {split_reason}")
 
     new_src = [f for f in files if f.status.startswith("A")
                and _in_source_root(f.path, cfg.source_roots or [])
@@ -1130,7 +1246,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         repo=repo, pathspec=pathspec,
         coupling=coupling, communities=communities, spec=spec,
     )
-    clusters, cluster_ranges = cluster(
+    clusters, cluster_ranges, cluster_split_reasons = cluster(
         chunks, cfg,
         chunk_ranges=chunk_ranges,
         coupling=coupling, communities=communities, spec=spec,
@@ -1139,7 +1255,8 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     candidates: list[Candidate] = []
     for i, group in enumerate(clusters, start=1):
         score, cls, signals = classify(
-            group, cfg, repo=repo, chunk_range=cluster_ranges.get(i - 1)
+            group, cfg, repo=repo, chunk_range=cluster_ranges.get(i - 1),
+            split_reason=cluster_split_reasons.get(i - 1),
         )
         all_files = sorted({f.path for c in group for f in c.files})
         dirs = sorted({d for c in group for d in c.top_dirs if d})
