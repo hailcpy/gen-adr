@@ -298,4 +298,23 @@ mkdir -p "$R11/src"
 echo "export const new_ = 1;" > "$R11/src/new_lib.ts"
 commit "$R11" 2024-01-02 "feat: replace old_lib with new_lib"
 
+# ---------------------------------------------------------------------------
+# Repo 12: module scope with boundary-crossing shared-path commits.
+# Two payments commits that ALSO touch lib/bus.ts must cluster under
+# module:src/payments when --full-diff exposes the shared file.
+# ---------------------------------------------------------------------------
+R12="$OUT/repo_module_shared"
+init "$R12"
+mkdir -p "$R12/src/payments" "$R12/lib"
+echo "// bus" > "$R12/lib/bus.ts"
+commit "$R12" 2024-01-01 "init"
+echo "export const foo = () => {};" > "$R12/src/payments/foo.ts"
+echo "// foo uses bus" >> "$R12/lib/bus.ts"
+commit "$R12" 2024-02-01 "feat: payments foo via shared bus (#1)"
+echo "export const bar = () => {};" > "$R12/src/payments/bar.ts"
+echo "// bar uses bus" >> "$R12/lib/bus.ts"
+commit "$R12" 2024-02-15 "feat: payments bar via shared bus (#2)"
+echo "export const baz = () => {};" > "$R12/src/payments/baz.ts"
+commit "$R12" 2024-03-01 "feat: payments baz local (#3)"
+
 echo "fixtures built in $OUT"
