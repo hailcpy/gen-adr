@@ -304,3 +304,59 @@ def test_module_scope_no_mega_cluster():
     stream = candidate_with(cands, "streaming")
     assert corr is not None and stream is not None
     assert id(corr) != id(stream), "correlation and streaming must not merge"
+
+
+# --- workaround detection (record_type routing) -------------------------------
+
+def _by_subject(manifest, needle):
+    return next(c for c in manifest["candidates"]
+                if any(needle in s for s in c["subjects"]))
+
+
+def test_workaround_marker_flips_record_type():
+    """A fix commit carrying a HACK marker in its diff becomes a workaround."""
+    m = analyze.analyze(repo("repo_workaround"))
+    c = _by_subject(m, "work around aws-sdk")
+    assert c["record_type"] == "workaround"
+    assert any("workaround marker added" in s for s in c["workaround_signals"])
+    assert c["classification"] != "architectural"
+
+
+def test_workaround_structural_file_detected():
+    """A shim file addition is a strong structural workaround signal."""
+    m = analyze.analyze(repo("repo_workaround"))
+    c = _by_subject(m, "monkeypatch legacy client")
+    assert c["record_type"] == "workaround"
+    assert any("workaround-shaped file" in s for s in c["workaround_signals"])
+
+
+def test_architectural_candidate_keeps_decision_type():
+    """Markers inside an architectural change annotate, never reroute."""
+    m = analyze.analyze(repo("repo_workaround"))
+    c = _by_subject(m, "adopt kafka")
+    assert c["classification"] == "architectural"
+    assert c["record_type"] == "decision"
+    assert any(s.startswith("WORKAROUND: markers present")
+               for s in c["workaround_signals"])
+
+
+def test_clean_commit_has_no_workaround_signals():
+    m = analyze.analyze(repo("repo_workaround"))
+    c = _by_subject(m, "add helpers")
+    assert c["record_type"] == "decision"
+    assert c["workaround_signals"] == []
+
+
+def test_workaround_detection_can_be_disabled():
+    cfg = analyze.Config(detect_workarounds=False)
+    m = analyze.analyze(repo("repo_workaround"), cfg=cfg)
+    assert all(c["record_type"] == "decision" for c in m["candidates"])
+    assert all(c["workaround_signals"] == [] for c in m["candidates"])
+
+
+def test_extra_workaround_markers_config():
+    """Project-specific marker regexes extend detection."""
+    cfg = analyze.Config(extra_workaround_markers=[r"drop metadata copy"])
+    m = analyze.analyze(repo("repo_workaround"), cfg=cfg)
+    c = _by_subject(m, "work around aws-sdk")
+    assert c["record_type"] == "workaround"

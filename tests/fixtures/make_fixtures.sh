@@ -317,4 +317,39 @@ commit "$R12" 2024-02-15 "feat: payments bar via shared bus (#2)"
 echo "export const baz = () => {};" > "$R12/src/payments/baz.ts"
 commit "$R12" 2024-03-01 "feat: payments baz local (#3)"
 
+# ---------------------------------------------------------------------------
+# Repo 13: workaround detection. Planted:
+#   - #2: borderline fix carrying a HACK marker comment   -> record_type workaround
+#   - #3: shim file + monkeypatch wording (no diff marker) -> workaround (structural)
+#   - #4: architectural (new src + dep) ALSO carrying a WORKAROUND marker
+#         -> stays a decision, with an also-workaround note signal
+#   - #5: clean feature commit                              -> decision, no signals
+# ---------------------------------------------------------------------------
+R13="$OUT/repo_workaround"
+init "$R13"
+mkdir -p "$R13/src"
+echo "export const app = () => {};" > "$R13/src/index.ts"
+commit "$R13" 2024-01-01 "feat: bootstrap app (#1)"
+
+cat > "$R13/src/upload.ts" <<'EOF'
+// HACK: drop metadata copy until aws-sdk multipart fix ships upstream
+export const upload = (f: object) => f;
+EOF
+commit "$R13" 2024-02-01 "fix: work around aws-sdk multipart metadata bug (#2)"
+
+mkdir -p "$R13/src/compat"
+echo "export const legacyShim = () => {};" > "$R13/src/compat/legacy_shim.ts"
+commit "$R13" 2024-03-01 "fix: monkeypatch legacy client via shim (#3)"
+
+mkdir -p "$R13/src/queue"
+cat > "$R13/src/queue/kafka.ts" <<'EOF'
+// WORKAROUND: pin partitioner until librdkafka fix lands
+export const producer = () => {};
+EOF
+echo '{"name":"app","dependencies":{"kafkajs":"^2.0.0"}}' > "$R13/package.json"
+commit "$R13" 2024-04-01 "feat: adopt kafka for event queue (#4)"
+
+echo "export const helpers = 1;" > "$R13/src/helpers.ts"
+commit "$R13" 2024-05-01 "feat: add helpers (#5)"
+
 echo "fixtures built in $OUT"
