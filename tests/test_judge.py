@@ -560,21 +560,37 @@ def test_extract_linked_shas_tolerates_whitespace():
 
 
 def test_citation_sha_not_in_allowed_set_fails():
-    """Citation citing a SHA not in the allowed set should be dropped."""
-    r = repo("repo_squash")
-    # Get a commit that exists but won't be in our allowed set
-    cands = analyze.analyze(r)["candidates"]
-    if len(cands) < 2:
-        pytest.skip("need at least 2 candidates in fixture")
-    sha_allowed = cands[0]["commits"][0] if cands[0]["commits"] else None
-    sha_cited = cands[1]["commits"][0] if len(cands) > 1 and cands[1]["commits"] else None
-    if not sha_cited or not sha_allowed or sha_cited == sha_allowed:
-        pytest.skip("couldn't find two different commits")
+    """A citation citing a real commit OUTSIDE the allowed set is dropped."""
+    r, sha_cited, path, _ = _first_commit_with_added_file("repo_squash")
+    # any other commit in the repo serves as the (wrong) allowed set
+    all_shas = analyze.git(r, "rev-list", "HEAD").split()
+    sha_allowed = next(s for s in all_shas if s != sha_cited)
 
-    adr = _adr_with_option("opt", f"<!-- evidence: {sha_cited} added:foo.py -->")
+    # the cited change is REAL (added:path holds) — it must fail on scope alone
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha_cited} added:{path} -->")
     result = judge.verify_adr(r, adr, allowed_shas=[sha_allowed])
     dropped = {o["option"]: o["reason"] for o in result["dropped"]}
     assert "opt" in dropped
+    assert "not part of this candidate" in dropped["opt"]
+
+
+def test_short_allowed_sha_never_matches():
+    """Sub-7-char prefixes must not match — a 1-char typo would otherwise
+    admit ~1/16 of all commits into scope."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[sha[0]])
+    dropped = {o["option"]: o["reason"] for o in result["dropped"]}
+    assert "not part of this candidate" in dropped["opt"]
+
+
+def test_explicit_empty_allowed_set_rejects_all():
+    """allowed_shas=[] means 'no commits in scope': scoped, and reject all."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[])
+    assert result["scoped"] is True
+    dropped = {o["option"]: o["reason"] for o in result["dropped"]}
     assert "not part of this candidate" in dropped["opt"]
 
 
@@ -676,3 +692,31 @@ def test_render_no_options_uses_scoped_logic():
     result_unscoped = judge.verify_adr(r, adr_no_links)
     out_unscoped = judge.render_verified_adr(adr_no_links, result_unscoped, date="2026-06-06")
     assert "verification: citation-structural-unscoped\n" in out_unscoped
+
+
+# --- CLI: unscoped warning ---------------------------------------------------
+
+def _run_cli(*argv):
+    import os
+    import subprocess
+    import sys
+    return subprocess.run([sys.executable, judge.__file__, *argv],
+                          capture_output=True, text=True)
+
+
+def test_cli_verify_adr_warns_when_unscoped(tmp_path):
+    """No --commits and no Links/Commits line -> stderr warning."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = tmp_path / "adr.md"
+    adr.write_text(_adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->"))
+    res = _run_cli("verify-adr", str(adr), "--repo", r)
+    assert res.returncode == 0
+    assert "citations verified unscoped" in res.stderr
+
+
+def test_cli_verify_adr_silent_when_commits_given(tmp_path):
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = tmp_path / "adr.md"
+    adr.write_text(_adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->"))
+    res = _run_cli("verify-adr", str(adr), "--repo", r, "--commits", sha)
+    assert "unscoped" not in res.stderr
