@@ -486,7 +486,7 @@ def test_render_stamps_no_options_adr():
     assert result["had_options"] is False
     out = judge.render_verified_adr(adr, result, date="2026-06-06")
     assert "evidence-verified: true" in out
-    assert "verification: citation-structural" in out
+    assert "verification: citation-structural-unscoped" in out
     assert "options-kept: 0" in out
     assert "options-dropped: 0" in out
 
@@ -515,3 +515,164 @@ def test_no_options_stamp_idempotent():
     rendered2 = judge.render_verified_adr(rendered1, result2, date="2026-06-06")
 
     assert rendered2 == rendered1
+
+
+# --- Fix 5: Enforce cited SHA & scoping ---
+
+def test_extract_linked_shas_parses_commits_line():
+    """extract_linked_shas should parse Links section with Commits: line."""
+    adr = (
+        "# D\n\n## Links\n\n"
+        "- Commits: abc1234, def5678\n\n"
+        "## Outcome\n\nx\n"
+    )
+    shas = judge.extract_linked_shas(adr)
+    assert shas == ["abc1234", "def5678"]
+
+
+def test_extract_linked_shas_missing_links_section():
+    """extract_linked_shas returns [] when no Links section."""
+    adr = "# D\n\n## Outcome\n\nx\n"
+    shas = judge.extract_linked_shas(adr)
+    assert shas == []
+
+
+def test_extract_linked_shas_case_insensitive_commits():
+    """extract_linked_shas is case-insensitive on 'Commits' keyword."""
+    adr = (
+        "# D\n\n## Links\n\n"
+        "- commits: abc1234\n\n"
+        "## Outcome\n\nx\n"
+    )
+    shas = judge.extract_linked_shas(adr)
+    assert shas == ["abc1234"]
+
+
+def test_extract_linked_shas_tolerates_whitespace():
+    """extract_linked_shas tolerates varied whitespace."""
+    adr = (
+        "# D\n\n## Links\n\n"
+        "- Commits:  abc1234  ,  def5678  \n\n"
+        "## Outcome\n\nx\n"
+    )
+    shas = judge.extract_linked_shas(adr)
+    assert set(shas) == {"abc1234", "def5678"}
+
+
+def test_citation_sha_not_in_allowed_set_fails():
+    """Citation citing a SHA not in the allowed set should be dropped."""
+    r = repo("repo_squash")
+    # Get a commit that exists but won't be in our allowed set
+    cands = analyze.analyze(r)["candidates"]
+    if len(cands) < 2:
+        pytest.skip("need at least 2 candidates in fixture")
+    sha_allowed = cands[0]["commits"][0] if cands[0]["commits"] else None
+    sha_cited = cands[1]["commits"][0] if len(cands) > 1 and cands[1]["commits"] else None
+    if not sha_cited or not sha_allowed or sha_cited == sha_allowed:
+        pytest.skip("couldn't find two different commits")
+
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha_cited} added:foo.py -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[sha_allowed])
+    dropped = {o["option"]: o["reason"] for o in result["dropped"]}
+    assert "opt" in dropped
+    assert "not part of this candidate" in dropped["opt"]
+
+
+def test_citation_sha_in_allowed_set_checked():
+    """Citation with SHA in the allowed set should be checked normally."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("good", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[sha])
+    kept = {o["option"] for o in result["kept"]}
+    assert "good" in kept
+
+
+def test_sha_prefix_matching():
+    """Short SHA in allowed set should match full SHA in citation and vice versa."""
+    r, sha_full, path, _ = _first_commit_with_added_file("repo_squash")
+    sha_short = sha_full[:7]
+    # Test 1: short in allowed, full in citation
+    adr1 = _adr_with_option("opt", f"<!-- evidence: {sha_full} added:{path} -->")
+    result1 = judge.verify_adr(r, adr1, allowed_shas=[sha_short])
+    assert result1["kept"], "full SHA citation should match short allowed SHA"
+
+    # Test 2: full in allowed, short in citation
+    adr2 = _adr_with_option("opt", f"<!-- evidence: {sha_short} added:{path} -->")
+    result2 = judge.verify_adr(r, adr2, allowed_shas=[sha_full])
+    assert result2["kept"], "short SHA citation should match full allowed SHA"
+
+
+def test_verify_adr_scoped_true_with_allowed_shas():
+    """verify_adr should set scoped=true when allowed_shas is non-empty."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[sha])
+    assert result["scoped"] is True
+
+
+def test_verify_adr_scoped_true_with_links_section():
+    """verify_adr should set scoped=true when Links/Commits present."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = (
+        "# D\n\n## Considered Options\n\n"
+        f"- opt <!-- evidence: {sha} added:{path} -->\n\n"
+        "## Links\n\n"
+        f"- Commits: {sha}\n\n"
+        "## Outcome\n\nx\n"
+    )
+    result = judge.verify_adr(r, adr)
+    assert result["scoped"] is True
+
+
+def test_verify_adr_scoped_false_without_allowed_set():
+    """verify_adr should set scoped=false when no Links/Commits and no --commits."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr)  # no allowed_shas parameter
+    assert result["scoped"] is False
+
+
+def test_render_uses_citation_structural_when_scoped():
+    """render_verified_adr should use 'citation-structural' when scoped."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr, allowed_shas=[sha])
+    out = judge.render_verified_adr(adr, result, date="2026-06-06")
+    assert "verification: citation-structural\n" in out
+    assert "citation-structural-unscoped" not in out
+
+
+def test_render_uses_citation_structural_unscoped_when_not_scoped():
+    """render_verified_adr should use 'citation-structural-unscoped' when not scoped."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = _adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->")
+    result = judge.verify_adr(r, adr)  # no allowed_shas
+    out = judge.render_verified_adr(adr, result, date="2026-06-06")
+    assert "verification: citation-structural-unscoped\n" in out
+    assert "verification: citation-structural\n" not in out
+
+
+def test_render_no_options_uses_scoped_logic():
+    """No-options ADR stamp should follow scoped/unscoped logic."""
+    r = repo("repo_squash")
+    # Get a real SHA for the Links section
+    cands = analyze.analyze(r)["candidates"]
+    if not cands or not cands[0]["commits"]:
+        pytest.skip("no commits in fixture")
+    sha = cands[0]["commits"][0]
+
+    # With Links/Commits: scoped
+    adr_with_links = (
+        "# D\n\n## Links\n\n"
+        f"- Commits: {sha}\n\n"
+        "## Outcome\n\nx\n"
+    )
+    result_scoped = judge.verify_adr(r, adr_with_links)
+    out_scoped = judge.render_verified_adr(adr_with_links, result_scoped, date="2026-06-06")
+    assert "verification: citation-structural\n" in out_scoped
+
+    # Without Links: unscoped
+    adr_no_links = "# D\n\n## Outcome\n\nx\n"
+    result_unscoped = judge.verify_adr(r, adr_no_links)
+    out_unscoped = judge.render_verified_adr(adr_no_links, result_unscoped, date="2026-06-06")
+    assert "verification: citation-structural-unscoped\n" in out_unscoped
