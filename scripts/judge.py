@@ -527,20 +527,21 @@ def _upsert_frontmatter(adr_text: str, lines: list[str]) -> str:
                 if line.rstrip().startswith("generation:"):
                     skip_generation = True
                 elif skip_generation:
-                    # Skip this line if it's indented (child of generation)
-                    if line and line[0] in " \t":
+                    # children of generation: indented lines, and blank lines
+                    # between them (a blank line must not end the block, or
+                    # the leftover children duplicate on the next upsert)
+                    if not line or line[0] in " \t":
                         continue
-                    else:
-                        skip_generation = False
-                        filtered.append(line)
+                    skip_generation = False
+                    filtered.append(line)
                 else:
                     filtered.append(line)
             # Reconstruct frontmatter, stripping leading/trailing empty lines
             fm_text = "\n".join(filtered).strip()
+            tail = adr_text[end + 4:]  # everything after the closing '\n---'
             if fm_text:
-                return "---\n" + fm_text + "\n" + block + adr_text[end:]
-            else:
-                return "---\n" + block + adr_text[end:]
+                return "---\n" + fm_text + "\n" + block + "\n---" + tail
+            return "---\n" + block + "\n---" + tail
     return f"---\n{block}\n---\n\n" + adr_text
 
 

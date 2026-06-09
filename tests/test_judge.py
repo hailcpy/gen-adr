@@ -456,6 +456,27 @@ def test_upsert_frontmatter_idempotent():
     assert rendered1.count("generation:") == 1
 
 
+def test_upsert_frontmatter_replaces_generation_only_block():
+    """Frontmatter holding ONLY a generation: block is replaced, not appended to."""
+    text = "---\ngeneration:\n  method: old\n---\n\n# T\n"
+    out = judge._upsert_frontmatter(text, ["generation:", "  method: new"])
+    assert out.count("generation:") == 1
+    assert "method: new" in out
+    assert "method: old" not in out
+    assert out.startswith("---\n")
+    assert "# T" in out
+
+
+def test_upsert_frontmatter_blank_line_inside_generation_block():
+    """A blank line between generation children must not end the block early."""
+    text = ("---\ntitle: x\ngeneration:\n  method: old\n\n  options-kept: 1\n---\n"
+            "\n# T\n")
+    out = judge._upsert_frontmatter(text, ["generation:", "  method: new"])
+    assert out.count("generation:") == 1
+    assert "options-kept: 1" not in out
+    assert "title: x" in out
+
+
 # --- Fix 4: Stamp no-options ADRs ---
 
 def test_render_stamps_no_options_adr():
