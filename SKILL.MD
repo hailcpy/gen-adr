@@ -362,10 +362,12 @@ After writing an ADR, run the verifier. It checks every option's inline citation
  
 ```bash
 python3 scripts/judge.py verify-adr docs/decisions/<NNNN-slug>.md \
-    --repo . --write --json
+    --repo . --commits "<sha1> <sha2> ..." --write --json
 ```
  
-For each option's citation it confirms the SHA exists, then confirms the claimed change is real: `deleted`/`added`/`renamed` against name-status, `removed:"line"` by grepping the commit's diff for that deleted line, `message:` by searching the commit message. An option is **dropped** if its citation fails, if its evidence type is not one of these (uncheckable), or if it has **no citation at all**. Because the git history is a closed corpus, every check is an exact lookup — a fabricated SHA fails `git cat-file` immediately.
+Pass the candidate's commit SHAs via `--commits`; without it the verifier falls back to the ADR's own `Links → Commits:` line. Either way the check is **scoped**: a citation pointing at a commit outside the candidate set is dropped, even if the cited change is real elsewhere in the repo (frontmatter records `verification: citation-structural`; if no commit set is available at all, it degrades to `citation-structural-unscoped`).
+ 
+For each option's citation it confirms the SHA belongs to the candidate and exists, then confirms the claimed change is real: `deleted`/`added`/`renamed` against name-status, `removed:"line"` by grepping the commit's diff for that deleted line, `message:` by searching the commit message. An option is **dropped** if its citation fails, if its evidence type is not one of these (uncheckable), or if it has **no citation at all**. Because the git history is a closed corpus, every check is an exact lookup — a fabricated SHA fails `git cat-file` immediately.
  
 With `--write`, the verifier rewrites the section (dropping unevidenced options, collapsing to "No alternatives recorded" if none survive) and stamps the frontmatter (see below). Run without `--write` to preview the kept/dropped table first; in **assisted mode**, preview, then apply.
  

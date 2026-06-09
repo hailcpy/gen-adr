@@ -163,12 +163,63 @@ CITATION_RE = re.compile(
     re.I,
 )
 
+LINKS_SECTION_RE = re.compile(r"^##\s+Links\s*$", re.I | re.M)
+COMMITS_LINE_RE = re.compile(
+    r"[-*]\s+Commits?:\s*(.+?)(?:\n|$)",
+    re.I,
+)
 # Every evidence type is verifiable by an exact git lookup — there is no LLM on
 # the verification path. `removed:` greps the cited commit's diff for a deleted
 # line, which covers "code replaced inside a modified file" deterministically.
 # Anything whose type is none of these is treated as uncheckable and dropped
 # (the safe direction: never assert an option we cannot pin to the bytes).
 DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message", "removed"}
+
+
+def extract_linked_shas(adr_text: str) -> list[str]:
+    """Parse the ADR's Links section for a 'Commits: <sha1>, <sha2>, ...' line.
+
+    Returns a list of hex tokens ≥7 hex chars, case-normalized to lowercase.
+    Returns [] if the Links section or Commits line is absent.
+    """
+    m = LINKS_SECTION_RE.search(adr_text)
+    if not m:
+        return []
+    rest = adr_text[m.end():]
+    next_header = NEXT_HEADER_RE.search(rest)
+    links_section = rest[: next_header.start()] if next_header else rest
+    commits_m = COMMITS_LINE_RE.search(links_section)
+    if not commits_m:
+        return []
+    commits_line = commits_m.group(1)
+    # Extract hex tokens ≥7 chars, separated by commas or whitespace
+    tokens = re.findall(r"[0-9a-fA-F]{7,}", commits_line)
+    return [t.lower() for t in tokens]
+
+
+def _resolve_allowed(adr_text: str,
+                     allowed_shas: Optional[list[str]]) -> Optional[list[str]]:
+    """Effective candidate-commit set for scoping, or None = unscoped.
+
+    An explicit list (even []) wins; None falls back to the ADR's own
+    Links -> Commits: line, and stays None when that line is absent.
+    """
+    if allowed_shas is not None:
+        return [s.lower() for s in allowed_shas]
+    linked = extract_linked_shas(adr_text)
+    return linked if linked else None
+
+
+def _shas_match(sha1: str, sha2: str) -> bool:
+    """Check if two SHAs match: either is a prefix of the other (case-insensitive).
+
+    Prefixes shorter than 7 hex chars never match — a 1-char --commits typo
+    would otherwise silently admit ~1/16 of the repo's commits into scope.
+    """
+    s1, s2 = sha1.lower(), sha2.lower()
+    if min(len(s1), len(s2)) < 7:
+        return False
+    return s1.startswith(s2) or s2.startswith(s1)
 
 
 @dataclass
@@ -230,12 +281,21 @@ def _name_status(repo: str, sha: str) -> list[tuple[str, list[str]]]:
     return rows
 
 
-def verify_citation(repo: str, c: Citation) -> tuple[str, str]:
+def verify_citation(repo: str, c: Citation, allowed_shas: Optional[list[str]] = None) -> tuple[str, str]:
     """Deterministically check one citation. Returns (status, reason).
+
+    If allowed_shas is non-empty, the citation SHA must match one of them
+    (prefix matching). If scoped and SHA doesn't match, returns (failed, reason).
 
     status: verified | failed | fuzzy. Non-deterministic evidence types are
     reported as fuzzy for the LLM residue judge rather than guessed at here.
     """
+    # If scoped (allowed_shas given, possibly empty = nothing allowed), check
+    # SHA membership before any git lookup
+    if allowed_shas is not None:
+        if not any(_shas_match(c.sha, allowed) for allowed in allowed_shas):
+            return "failed", f"commit {c.sha} not part of this candidate (see Links)"
+
     try:
         kind = analyze.git(repo, "cat-file", "-t", c.sha).strip()
     except RuntimeError:
@@ -271,12 +331,18 @@ def verify_citation(repo: str, c: Citation) -> tuple[str, str]:
     return "failed", f"no {c.etype} of {want} in {c.sha}"
 
 
-def verify_options(repo: str, adr_text: str) -> dict:
+def verify_options(repo: str, adr_text: str, allowed_shas: Optional[list[str]] = None) -> dict:
     """Deterministic pass over an ADR's cited options. No model calls.
+
+    allowed_shas=None derives the candidate set from the ADR's Links section
+    (unscoped if that is absent); an explicit list — even an empty one —
+    is used as-is, so [] means "no commits in scope, reject every citation".
 
     overall: pass (all verified / nothing to check) or fail (any option not
     verified — failed, uncited, or uncheckable type).
     """
+    effective_allowed = _resolve_allowed(adr_text, allowed_shas)
+
     cited = extract_cited_options(adr_text)
     verdicts: list[CitationVerdict] = []
     for co in cited:
@@ -284,13 +350,14 @@ def verify_options(repo: str, adr_text: str) -> dict:
             verdicts.append(CitationVerdict(co.option, "uncited",
                                             "no inline evidence citation"))
             continue
-        status, reason = verify_citation(repo, co.citation)
+        status, reason = verify_citation(repo, co.citation, effective_allowed)
         verdicts.append(CitationVerdict(co.option, status, reason))
 
     overall = "pass" if all(v.status == "verified" for v in verdicts) else "fail"
     return {
         "overall": overall,
         "verdicts": [asdict(v) for v in verdicts],
+        "scoped": effective_allowed is not None,
     }
 
 
@@ -464,13 +531,22 @@ class OptionOutcome:
     raw: str        # original list-item content (kept options re-emitted verbatim)
 
 
-def verify_adr(repo: str, adr_text: str) -> dict:
+def verify_adr(repo: str, adr_text: str, allowed_shas: Optional[list[str]] = None) -> dict:
     """Deterministic verification of an ADR's Considered Options. No model.
+
+    allowed_shas=None derives the candidate set from the ADR's Links section
+    (unscoped if that is absent); an explicit list — even an empty one —
+    is used as-is, so [] means "no commits in scope, reject every citation".
 
     Each option's inline citation is checked against git. `verified` -> kept;
     anything else (failed structural check, no citation, or an uncheckable
     evidence type) -> dropped. Reproducible: same repo + text -> same result.
+
+    Returns a dict with a 'scoped' key: true iff a candidate set was in force.
     """
+    effective_allowed = _resolve_allowed(adr_text, allowed_shas)
+    scoped = effective_allowed is not None
+
     cited = extract_cited_options(adr_text)
     outcomes: list[OptionOutcome] = []
 
@@ -479,7 +555,7 @@ def verify_adr(repo: str, adr_text: str) -> dict:
             outcomes.append(OptionOutcome(co.option, "dropped", "uncited",
                                           "no inline evidence citation", co.raw))
             continue
-        status, reason = verify_citation(repo, co.citation)
+        status, reason = verify_citation(repo, co.citation, effective_allowed)
         decision = "kept" if status == "verified" else "dropped"
         outcomes.append(OptionOutcome(co.option, decision, status, reason, co.raw))
 
@@ -490,6 +566,7 @@ def verify_adr(repo: str, adr_text: str) -> dict:
         "kept": [asdict(o) for o in kept],
         "dropped": [asdict(o) for o in dropped],
         "had_options": bool(cited),
+        "scoped": scoped,
     }
 
 
@@ -551,9 +628,16 @@ def render_verified_adr(adr_text: str, result: dict,
     """Produce the published ADR: drop unevidenced options, re-emit verified
     ones verbatim (with their hidden citation comments), and stamp the
     evidence-verified provenance into the frontmatter.
+
+    The 'scoped' flag in result determines whether to use 'citation-structural'
+    (scoped) or 'citation-structural-unscoped' (unscoped) verification method.
+    `result` must come from this version's verify_adr — a dict without the
+    'scoped' key is stamped as unscoped (the safe direction).
     """
     import datetime
     date = date or datetime.date.today().isoformat()
+    scoped = result.get("scoped", False)
+    verification_method = "citation-structural" if scoped else "citation-structural-unscoped"
 
     if not result.get("had_options"):
         # No Considered Options section or "No alternatives recorded" ADRs:
@@ -563,7 +647,7 @@ def render_verified_adr(adr_text: str, result: dict,
             f"  method: {method}",
             f"  generated: {date}",
             "  evidence-verified: true",
-            "  verification: citation-structural",
+            f"  verification: {verification_method}",
             "  options-kept: 0",
             "  options-dropped: 0",
         ])
@@ -581,7 +665,7 @@ def render_verified_adr(adr_text: str, result: dict,
         f"  method: {method}",
         f"  generated: {date}",
         "  evidence-verified: true",
-        "  verification: citation-structural",
+        f"  verification: {verification_method}",
         f"  options-kept: {len(kept)}",
         f"  options-dropped: {len(result['dropped'])}",
     ])
@@ -589,6 +673,10 @@ def render_verified_adr(adr_text: str, result: dict,
 
 
 # --- CLI ---------------------------------------------------------------------
+
+_UNSCOPED_WARNING = ("warning: no candidate commit set (no --commits and no "
+                     "Links/Commits line); citations verified unscoped")
+
 
 def _cmd_check_tags(args) -> int:
     report = check_tags(args.repo, args.files)
@@ -616,7 +704,10 @@ def _cmd_evidence(args) -> int:
 
 def _cmd_verify_options(args) -> int:
     adr_text = open(args.adr).read()
-    report = verify_options(args.repo, adr_text)
+    allowed_shas = _split_shas(args.commits) if args.commits else None
+    report = verify_options(args.repo, adr_text, allowed_shas)
+    if not report["scoped"]:
+        print(_UNSCOPED_WARNING, file=sys.stderr)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -629,7 +720,10 @@ def _cmd_verify_options(args) -> int:
 
 def _cmd_verify_adr(args) -> int:
     adr_text = open(args.adr).read()
-    result = verify_adr(args.repo, adr_text)
+    allowed_shas = _split_shas(args.commits) if args.commits else None
+    result = verify_adr(args.repo, adr_text, allowed_shas)
+    if not result["scoped"]:
+        print(_UNSCOPED_WARNING, file=sys.stderr)
     rendered = render_verified_adr(adr_text, result)
     if args.write:
         with open(args.adr, "w") as fh:
@@ -689,6 +783,9 @@ def main() -> int:
                         help="tier-1 deterministic check of inline option citations")
     vo.add_argument("adr")
     vo.add_argument("--repo", default=".")
+    vo.add_argument("--commits", default=None,
+                    help="comma/space-separated candidate SHAs (>=7 hex chars); "
+                         "if given, citations must cite one")
     vo.add_argument("--json", action="store_true")
     vo.set_defaults(func=_cmd_verify_options)
 
@@ -696,6 +793,9 @@ def main() -> int:
                         help="deterministic citation verify: drop unevidenced, stamp provenance")
     va.add_argument("adr")
     va.add_argument("--repo", default=".")
+    va.add_argument("--commits", default=None,
+                    help="comma/space-separated candidate SHAs (>=7 hex chars); "
+                         "if given, citations must cite one")
     va.add_argument("--write", action="store_true", help="rewrite the ADR in place")
     va.add_argument("--json", action="store_true")
     va.set_defaults(func=_cmd_verify_adr)
