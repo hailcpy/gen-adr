@@ -162,6 +162,7 @@ CITATION_RE = re.compile(
     r"(?P<etype>[a-z-]+):(?P<detail>.+?)\s*-->",
     re.I,
 )
+
 # Every evidence type is verifiable by an exact git lookup — there is no LLM on
 # the verification path. `removed:` greps the cited commit's diff for a deleted
 # line, which covers "code replaced inside a modified file" deterministically.
@@ -507,12 +508,39 @@ def _replace_options_section(adr_text: str, new_body: str) -> str:
 
 
 def _upsert_frontmatter(adr_text: str, lines: list[str]) -> str:
-    """Insert verification provenance into YAML frontmatter (created if absent)."""
+    """Insert verification provenance into YAML frontmatter (created if absent).
+
+    When updating existing frontmatter, first removes any existing generation:
+    block to avoid duplicates on idempotent runs.
+    """
     block = "\n".join(lines)
     if adr_text.startswith("---\n"):
         end = adr_text.find("\n---", 4)
         if end != -1:
-            return adr_text[:end] + "\n" + block + adr_text[end:]
+            # Remove existing generation: block before inserting the new one
+            fm_text = adr_text[4:end]  # content between opening --- and closing ---
+            # Remove generation: block and all its indented children
+            fm_lines = fm_text.split("\n")
+            filtered = []
+            skip_generation = False
+            for line in fm_lines:
+                if line.rstrip().startswith("generation:"):
+                    skip_generation = True
+                elif skip_generation:
+                    # Skip this line if it's indented (child of generation)
+                    if line and line[0] in " \t":
+                        continue
+                    else:
+                        skip_generation = False
+                        filtered.append(line)
+                else:
+                    filtered.append(line)
+            # Reconstruct frontmatter, stripping leading/trailing empty lines
+            fm_text = "\n".join(filtered).strip()
+            if fm_text:
+                return "---\n" + fm_text + "\n" + block + adr_text[end:]
+            else:
+                return "---\n" + block + adr_text[end:]
     return f"---\n{block}\n---\n\n" + adr_text
 
 
@@ -523,8 +551,22 @@ def render_verified_adr(adr_text: str, result: dict,
     ones verbatim (with their hidden citation comments), and stamp the
     evidence-verified provenance into the frontmatter.
     """
+    import datetime
+    date = date or datetime.date.today().isoformat()
+
     if not result.get("had_options"):
-        return adr_text  # 'No alternatives recorded' ADRs need no rewrite
+        # No Considered Options section or "No alternatives recorded" ADRs:
+        # still stamp with provenance, but don't rewrite the body
+        out = _upsert_frontmatter(adr_text, [
+            "generation:",
+            f"  method: {method}",
+            f"  generated: {date}",
+            "  evidence-verified: true",
+            "  verification: citation-structural",
+            "  options-kept: 0",
+            "  options-dropped: 0",
+        ])
+        return re.sub(r"\n{3,}", "\n\n", out)  # collapse blank-line artifacts
 
     kept = result["kept"]
     if kept:
@@ -533,8 +575,6 @@ def render_verified_adr(adr_text: str, result: dict,
         body = NO_ALT_LINE
     out = _replace_options_section(adr_text, body)
 
-    import datetime
-    date = date or datetime.date.today().isoformat()
     out = _upsert_frontmatter(out, [
         "generation:",
         f"  method: {method}",

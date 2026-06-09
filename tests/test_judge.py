@@ -370,12 +370,19 @@ def test_render_upserts_into_existing_frontmatter():
     assert "evidence-verified: true" in out
 
 
-def test_no_options_adr_unchanged():
+def test_no_options_adr_stamped_with_generation():
+    """No-options ADRs now get stamped with the generation block (Fix 4)."""
     adr = ("# D\n\n## Considered Options\n\n" + judge.NO_ALT_LINE
            + "\n\n## Decision Outcome\n\nx\n")
     result = judge.verify_adr(repo("repo_squash"), adr)
     assert result["overall"] == "pass"
-    assert judge.render_verified_adr(adr, result) == adr
+    rendered = judge.render_verified_adr(adr, result, date="2026-06-06")
+    # Now should have frontmatter with generation block
+    assert "---\n" in rendered
+    assert "generation:" in rendered
+    assert "evidence-verified: true" in rendered
+    # Body should be unchanged
+    assert "## Decision Outcome" in rendered
 
 
 # --- N-run aggregation -------------------------------------------------------
@@ -425,3 +432,65 @@ def test_runner_is_called_per_run():
         return ok
     judge_options(["X"], "ev", runner=counting, runs=4)
     assert calls["n"] == 4
+
+
+# --- Fix 3: Idempotent frontmatter ---
+
+def test_upsert_frontmatter_idempotent():
+    """Running verify_adr twice on the same ADR should produce identical output."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = (
+        "# D\n\n## Considered Options\n\n"
+        f"- good <!-- evidence: {sha} added:{path} -->\n\n"
+        "## Decision Outcome\n\nx\n"
+    )
+    result1 = judge.verify_adr(r, adr)
+    rendered1 = judge.render_verified_adr(adr, result1, date="2026-06-06")
+
+    # Run verify_adr + render again on the first output
+    result2 = judge.verify_adr(r, rendered1)
+    rendered2 = judge.render_verified_adr(rendered1, result2, date="2026-06-06")
+
+    assert rendered2 == rendered1
+    # generation: block should appear exactly once
+    assert rendered1.count("generation:") == 1
+
+
+# --- Fix 4: Stamp no-options ADRs ---
+
+def test_render_stamps_no_options_adr():
+    """ADRs with no Considered Options section should get stamped with evidence-verified."""
+    adr = "# D\n\nNo content.\n"
+    result = judge.verify_adr(repo("repo_squash"), adr)
+    assert result["had_options"] is False
+    out = judge.render_verified_adr(adr, result, date="2026-06-06")
+    assert "evidence-verified: true" in out
+    assert "verification: citation-structural" in out
+    assert "options-kept: 0" in out
+    assert "options-dropped: 0" in out
+
+
+def test_render_stamps_no_alternatives_recorded_adr():
+    """ADRs with 'No alternatives recorded' should get stamped."""
+    adr = (
+        "# D\n\n## Considered Options\n\n" + judge.NO_ALT_LINE
+        + "\n\n## Decision Outcome\n\nx\n"
+    )
+    result = judge.verify_adr(repo("repo_squash"), adr)
+    assert result["had_options"] is False
+    out = judge.render_verified_adr(adr, result, date="2026-06-06")
+    assert "evidence-verified: true" in out
+    assert "options-kept: 0" in out
+
+
+def test_no_options_stamp_idempotent():
+    """No-options ADRs should be stamped idempotently."""
+    adr = "# D\n\nNo content.\n"
+    r = repo("repo_squash")
+    result1 = judge.verify_adr(r, adr)
+    rendered1 = judge.render_verified_adr(adr, result1, date="2026-06-06")
+
+    result2 = judge.verify_adr(r, rendered1)
+    rendered2 = judge.render_verified_adr(rendered1, result2, date="2026-06-06")
+
+    assert rendered2 == rendered1
