@@ -1,0 +1,7 @@
+{
+  "min_dir_depth": 3,
+  "cluster_cap": 8,
+  "split_oversized": true,
+  "extra_stopwords": ["bf1", "bfv", "bf6", "bf2042", "game", "server", "player", "api", "endpoint", "get", "list", "info", "data", "key", "value", "cache", "redis", "mongo", "docker", "update", "include", "change", "modify", "add", "remove", "delete", "move", "rename", "format", "fix", "revert", "undo", "stop", "disable", "enable", "start", "handle", "implement"],
+  "extra_generic_basenames": ["router", "utilities", "schemas", "mappings", "client", "api_client", "websocket", "database", "parameters", "keys", "entries_info", "authorisation", "grpc_client", "json_rpc_client", "session_api_client", "ea_api_client", "bf1_api_client", "bfv_api_client", "bf6_api_client", "api_client", "auth", "main", "config", "docker-compose"]
+}

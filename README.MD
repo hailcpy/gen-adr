@@ -2,6 +2,8 @@
   <img src="assets/logo.png?v=2" alt="adr-generator" width="600"/>
 </p>
 
+![test](https://github.com/hailcpy/gen-adr/actions/workflows/test.yml/badge.svg)
+
 # adr-generator
 
 A skill for AI coding agents (Claude) that retroactively generates [MADR](https://adr.github.io/madr/)-format Architectural Decision Records from an existing codebase's git history, and annotates relevant code with inline `@ADR` reference tags.
@@ -67,7 +69,7 @@ A coding agent can now `grep -r "@ADR"` and surface every architectural decision
 
 ### Quick (default for repos under ~500 commits)
 
-For small/medium repos the full multi-step loop is overkill. The agent runs `analyze.py` once as a scored classifier, reads its JSON output (each candidate carries `score`, `classification`, and a `diff_summary`), triages without calling `git diff` by hand, writes MARDs directly, then runs `judge.py` as the safety net.
+For small/medium repos the full multi-step loop is overkill. The agent runs `analyze.py` once as a scored classifier, reads its JSON output (each candidate carries `score`, `classification`, and a `diff_summary`), triages without calling `git diff` by hand, writes MADRs directly, then runs `judge.py` as the safety net.
 
 ```
 "Run adr-generator on this repo"
