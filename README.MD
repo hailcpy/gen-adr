@@ -63,6 +63,24 @@ func NewServiceClient(addr string) (*ServiceClient, error) {
 
 A coding agent can now `grep -r "@ADR"` and surface every architectural decision site in the codebase.
 
+### Workaround logs
+
+Not every significant change is a decision — some are **workarounds**: monkey patches, shims, vendored patches, pins "until upstream fixes it". `analyze.py` detects these from diff content (HACK/WORKAROUND/FIXME-until markers, shim/adapter/polyfill files, `patches/`) and routes them to a different record type with the fields MADR lacks: **Trigger** (the upstream bug) and **Removal Condition** (when it can be deleted).
+
+```
+docs/decisions/
+├── 0006-grpc-inter-service-transport.md      ← decision (MADR)
+└── 0007-wa-aws-multipart-metadata.md         ← workaround log (type: workaround)
+```
+
+Workaround sites get a distinct tag prefix, so live workarounds are separately greppable:
+
+```typescript
+// @WA-0007-aws-multipart-metadata: manual metadata copy around aws-sdk bug — see docs/decisions/0007-wa-aws-multipart-metadata.md
+```
+
+The same citation verifier covers them (`marker:"<added line>"` evidence pinned to the introducing commit), and `judge.py check-workarounds` turns the log into a standing cleanup queue: it flags active records whose marker line has disappeared from the working tree ("possibly removed — update status") and, with `--check-upstream`, linked upstream issues that have since closed ("removal condition may be met").
+
 ---
 
 ## Modes
