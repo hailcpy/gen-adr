@@ -814,3 +814,96 @@ def test_madr_ignores_evidence_section():
     assert result["record_type"] == "madr"
     assert {o["option"] for o in result["kept"]} == {"good"}
     assert not result["dropped"]  # the Evidence bullet was not treated as an option
+
+
+# --- check-workarounds (lifecycle) --------------------------------------------
+
+WA_MARKER = "// HACK: drop metadata copy until aws-sdk multipart fix ships upstream"
+
+
+def _clone_with_wa_record(tmp_path):
+    """Clone repo_workaround and drop a workaround record citing its HACK line."""
+    import subprocess
+    src = repo("repo_workaround")
+    dst = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", src, str(dst)], check=True)
+    r = str(dst)
+    sha = analyze.git(r, "log", "--format=%H",
+                      "--grep=work around aws-sdk").strip()
+    rec_dir = dst / "docs" / "decisions"
+    rec_dir.mkdir(parents=True)
+    (rec_dir / "0001-wa-aws-multipart.md").write_text(
+        "---\ntype: workaround\nstatus: active\n---\n\n"
+        "# Copy metadata around aws-sdk bug\n\n"
+        "## Evidence\n\n"
+        f'- hack marker <!-- evidence: {sha} marker:"{WA_MARKER}" -->\n'
+        f"\n## Removal Condition\n\nDelete when aws-sdk ships the fix.\n\n"
+        f"## Links\n\n- Commits: {sha}\n"
+    )
+    return r, dst, sha
+
+
+def test_check_workarounds_marker_present(tmp_path):
+    r, _, _ = _clone_with_wa_record(tmp_path)
+    report = judge.check_workarounds(r)
+    assert report["checked"] == 1
+    assert report["flagged"] == 0
+    assert report["records"][0]["findings"] == []
+
+
+def test_check_workarounds_flags_removed_marker(tmp_path):
+    r, dst, _ = _clone_with_wa_record(tmp_path)
+    # simulate the workaround being deleted from the code
+    upload = dst / "src" / "upload.ts"
+    upload.write_text("export const upload = (f: object) => f;\n")
+    report = judge.check_workarounds(r)
+    assert report["flagged"] == 1
+    assert any("possibly removed" in f
+               for f in report["records"][0]["findings"])
+
+
+def test_check_workarounds_skips_non_active(tmp_path):
+    r, dst, _ = _clone_with_wa_record(tmp_path)
+    rec = dst / "docs" / "decisions" / "0001-wa-aws-multipart.md"
+    rec.write_text(rec.read_text().replace("status: active", "status: removed"))
+    (dst / "src" / "upload.ts").write_text("export const upload = 1;\n")
+    report = judge.check_workarounds(r)
+    assert report["flagged"] == 0
+    assert report["records"][0]["status"] == "removed"
+
+
+def test_check_workarounds_flags_untrackable(tmp_path):
+    r, dst, sha = _clone_with_wa_record(tmp_path)
+    rec = dst / "docs" / "decisions" / "0001-wa-aws-multipart.md"
+    rec.write_text(
+        "---\ntype: workaround\nstatus: active\n---\n\n# W\n\n"
+        "## Evidence\n\nNo verifiable evidence recorded.\n\n"
+        f"## Links\n\n- Commits: {sha}\n"
+    )
+    report = judge.check_workarounds(r)
+    assert report["flagged"] == 1
+    assert any("no marker citations" in f
+               for f in report["records"][0]["findings"])
+
+
+def test_find_workaround_records_ignores_madrs(tmp_path):
+    r, dst, _ = _clone_with_wa_record(tmp_path)
+    (dst / "docs" / "decisions" / "0002-plain-madr.md").write_text(
+        "# Plain decision\n\n## Considered Options\n\nNo alternatives "
+        "recorded in commit history.\n")
+    found = judge.find_workaround_records(r)
+    assert found == ["docs/decisions/0001-wa-aws-multipart.md"]
+
+
+def test_verify_adr_on_fixture_workaround_record(tmp_path):
+    """End-to-end: the record citing the fixture's real HACK line verifies."""
+    r, dst, _ = _clone_with_wa_record(tmp_path)
+    rec = dst / "docs" / "decisions" / "0001-wa-aws-multipart.md"
+    text = rec.read_text()
+    result = judge.verify_adr(r, text)
+    assert result["record_type"] == "workaround"
+    assert result["scoped"] is True
+    assert {o["option"] for o in result["kept"]} == {"hack marker"}
+    rendered = judge.render_verified_adr(text, result, date="2026-06-10")
+    assert "evidence-verified: true" in rendered
+    assert "status: active" in rendered  # frontmatter fields preserved

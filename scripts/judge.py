@@ -29,6 +29,7 @@ Usage:
     python3 scripts/judge.py verify-adr  <adr.md> --repo <repo> [--write] [--json]
     python3 scripts/judge.py verify-options <adr.md> --repo <repo> [--json]
     python3 scripts/judge.py judge-options  <adr.md> [--commits SHAs | --evidence f]
+    python3 scripts/judge.py check-workarounds <repo> [--check-upstream] [--json]
 """
 from __future__ import annotations
 
@@ -188,18 +189,31 @@ DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message", "removed", "mar
 # the workaround exists in the history).
 
 RECORD_TYPE_RE = re.compile(r"^type:\s*([\w-]+)\s*$", re.M)
+STATUS_RE = re.compile(r"^status:\s*([\w-]+)\s*$", re.M)
 VERIFIABLE_SECTIONS = {"madr": "Considered Options", "workaround": "Evidence"}
+
+
+def _frontmatter(adr_text: str) -> str:
+    """Raw YAML frontmatter body, or '' when absent."""
+    if adr_text.startswith("---\n"):
+        end = adr_text.find("\n---", 4)
+        if end != -1:
+            return adr_text[4:end]
+    return ""
 
 
 def record_type_of(adr_text: str) -> str:
     """Record type from YAML frontmatter; 'madr' when absent or unknown."""
-    if adr_text.startswith("---\n"):
-        end = adr_text.find("\n---", 4)
-        if end != -1:
-            m = RECORD_TYPE_RE.search(adr_text[4:end])
-            if m and m.group(1).lower() in VERIFIABLE_SECTIONS:
-                return m.group(1).lower()
+    m = RECORD_TYPE_RE.search(_frontmatter(adr_text))
+    if m and m.group(1).lower() in VERIFIABLE_SECTIONS:
+        return m.group(1).lower()
     return "madr"
+
+
+def status_of(adr_text: str) -> str:
+    """Lifecycle status from frontmatter; workaround records default to active."""
+    m = STATUS_RE.search(_frontmatter(adr_text))
+    return m.group(1).lower() if m else "active"
 
 
 def _section_re(rtype: str) -> "re.Pattern":
@@ -728,6 +742,109 @@ def render_verified_adr(adr_text: str, result: dict,
     return re.sub(r"\n{3,}", "\n\n", out)  # collapse blank-line artifacts
 
 
+# --- workaround lifecycle (check-workarounds) ---------------------------------
+#
+# A workaround log's Removal Condition only earns its keep if something checks
+# it. check_workarounds is that something: deterministic working-tree checks by
+# default (does the cited marker line still exist?), optional gh-backed upstream
+# checks behind --check-upstream. It only REPORTS — status transitions are a
+# human call, the tool never rewrites records.
+
+_WALK_SKIP = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "vendor",
+    "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
+})
+ISSUE_URL_RE = re.compile(
+    r"https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+")
+_RECORD_NAME_RE = re.compile(r"^\d{4}-.*\.md$")
+
+
+def find_workaround_records(repo: str) -> list[str]:
+    """Repo-relative paths of NNNN-*.md files under any docs/decisions dir
+    whose frontmatter declares type: workaround. Walk is deny-list bounded."""
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _WALK_SKIP and not d.startswith(".")]
+        if not dirpath.replace(os.sep, "/").endswith("docs/decisions"):
+            continue
+        for fn in sorted(filenames):
+            if not _RECORD_NAME_RE.match(fn):
+                continue
+            full = os.path.join(dirpath, fn)
+            try:
+                text = open(full).read()
+            except OSError:
+                continue
+            if record_type_of(text) == "workaround":
+                out.append(os.path.relpath(full, repo))
+    return sorted(out)
+
+
+def _marker_in_worktree(repo: str, detail: str) -> bool:
+    """True if the cited marker line still exists in tracked non-markdown files.
+
+    Markdown is excluded so the record's own citation comment (which quotes the
+    marker verbatim) never satisfies its own check.
+    """
+    res = subprocess.run(
+        ["git", "-C", repo, "grep", "-qF", "-e", detail,
+         "--", ".", ":(exclude)*.md"],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
+def check_workarounds(repo: str, check_upstream: bool = False) -> dict:
+    """Lifecycle report over all workaround records in `repo`.
+
+    For each `status: active` record:
+      - its Evidence `marker:` citations are grepped in the working tree;
+        a vanished line -> "possibly removed; update status"
+      - a record with no marker citations is flagged untrackable
+      - with check_upstream and `gh` on PATH, linked GitHub issues/PRs that
+        are CLOSED -> "removal condition may be met"
+    Non-active records are listed but not checked. Deterministic by default
+    (the upstream check is opt-in because it needs the network).
+    """
+    records: list[dict] = []
+    flagged = 0
+    for rel in find_workaround_records(repo):
+        try:
+            text = open(os.path.join(repo, rel)).read()
+        except OSError:
+            continue
+        status = status_of(text)
+        findings: list[str] = []
+        if status == "active":
+            cited = extract_cited_options(text, _section_re("workaround"))
+            markers = [co.citation for co in cited
+                       if co.citation and co.citation.etype == "marker"]
+            if not markers:
+                findings.append("no marker citations to track — removal "
+                                "cannot be detected automatically")
+            for cit in markers:
+                if not _marker_in_worktree(repo, cit.detail):
+                    findings.append(
+                        f'marker line not found in working tree: "{cit.detail}"'
+                        f" — workaround possibly removed; update status")
+            if check_upstream and _have("gh"):
+                for url in sorted(set(ISSUE_URL_RE.findall(text))):
+                    res = subprocess.run(
+                        ["gh", "issue", "view", url, "--json", "state",
+                         "-q", ".state"],
+                        capture_output=True, text=True,
+                    )
+                    if res.returncode == 0 and \
+                            res.stdout.strip().upper() == "CLOSED":
+                        findings.append(f"upstream issue closed: {url} — "
+                                        f"removal condition may be met")
+        if findings:
+            flagged += 1
+        records.append({"path": rel, "status": status, "findings": findings})
+    return {"records": records, "checked": len(records), "flagged": flagged}
+
+
 # --- CLI ---------------------------------------------------------------------
 
 _UNSCOPED_WARNING = ("warning: no candidate commit set (no --commits and no "
@@ -820,6 +937,20 @@ def _cmd_judge_options(args) -> int:
     return 0 if verdict.overall == "pass" else 1
 
 
+def _cmd_check_workarounds(args) -> int:
+    report = check_workarounds(args.repo, check_upstream=args.check_upstream)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        for r in report["records"]:
+            mark = "FLAG" if r["findings"] else "ok"
+            print(f"  [{r['status']:10}/{mark:4}] {r['path']}")
+            for f in r["findings"]:
+                print(f"      - {f}")
+        print(f"{report['flagged']}/{report['checked']} workaround records flagged")
+    return 1 if (args.strict and report["flagged"]) else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -855,6 +986,17 @@ def main() -> int:
     va.add_argument("--write", action="store_true", help="rewrite the ADR in place")
     va.add_argument("--json", action="store_true")
     va.set_defaults(func=_cmd_verify_adr)
+
+    cw = sub.add_parser("check-workarounds",
+                        help="lifecycle report: active workaround records whose "
+                             "markers vanished or upstream issues closed")
+    cw.add_argument("repo")
+    cw.add_argument("--check-upstream", action="store_true",
+                    help="also query linked GitHub issues via gh (network)")
+    cw.add_argument("--strict", action="store_true",
+                    help="exit 1 when any record is flagged (for CI)")
+    cw.add_argument("--json", action="store_true")
+    cw.set_defaults(func=_cmd_check_workarounds)
 
     jo = sub.add_parser("judge-options", help="audit Considered Options for hallucination")
     jo.add_argument("adr")
