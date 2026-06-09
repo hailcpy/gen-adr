@@ -720,3 +720,97 @@ def test_cli_verify_adr_silent_when_commits_given(tmp_path):
     adr.write_text(_adr_with_option("opt", f"<!-- evidence: {sha} added:{path} -->"))
     res = _run_cli("verify-adr", str(adr), "--repo", r, "--commits", sha)
     assert "unscoped" not in res.stderr
+
+
+# --- marker citations + record types (workaround support) --------------------
+
+def _first_added_line(r, sha):
+    """First non-empty quote-free added line of a commit (marker test target)."""
+    diff = analyze.git(r, "show", "--format=", "--unified=0", sha)
+    return next(l[1:].strip() for l in diff.splitlines()
+                if l.startswith("+") and not l.startswith("+++")
+                and '"' not in l and l[1:].strip())
+
+
+def test_marker_citation_verified():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    line = _first_added_line(r, sha)
+    status, reason = judge.verify_citation(r, judge.Citation(sha, "marker", line))
+    assert status == "verified"
+    assert "added in" in reason
+
+
+def test_marker_citation_fails_for_absent_line():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    status, _ = judge.verify_citation(
+        r, judge.Citation(sha, "marker", "THIS LINE WAS NEVER ADDED"))
+    assert status == "failed"
+
+
+def test_record_type_of_frontmatter():
+    assert judge.record_type_of(
+        "---\ntype: workaround\nstatus: active\n---\n\n# T\n") == "workaround"
+    assert judge.record_type_of("# T\n") == "madr"
+    # unknown types fall back to madr rather than guessing a section
+    assert judge.record_type_of("---\ntype: exotic\n---\n\n# T\n") == "madr"
+
+
+def _workaround_record(sha, marker_line, extra_bullets=""):
+    return (
+        "---\ntype: workaround\nstatus: active\n---\n\n"
+        "# Work around upstream bug\n\n"
+        "## Trigger\n\nUpstream bug in dep.\n\n"
+        "## Evidence\n\n"
+        f'- marker comment <!-- evidence: {sha} marker:"{marker_line}" -->\n'
+        f"{extra_bullets}"
+        "\n## Removal Condition\n\nDelete when the fix ships.\n\n"
+        f"## Links\n\n- Commits: {sha}\n"
+    )
+
+
+def test_verify_adr_workaround_checks_evidence_section():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    line = _first_added_line(r, sha)
+    adr = _workaround_record(
+        sha, line,
+        extra_bullets=f'- bogus <!-- evidence: {sha} marker:"NEVER ADDED" -->\n')
+    result = judge.verify_adr(r, adr)
+    assert result["record_type"] == "workaround"
+    kept = {o["option"] for o in result["kept"]}
+    dropped = {o["option"] for o in result["dropped"]}
+    assert "marker comment" in kept
+    assert "bogus" in dropped
+
+    rendered = judge.render_verified_adr(adr, result, date="2026-06-10")
+    assert "NEVER ADDED" not in rendered
+    assert "evidence-verified: true" in rendered
+    assert "type: workaround" in rendered      # original frontmatter preserved
+    assert "verification: citation-structural\n" in rendered  # Links -> scoped
+
+
+def test_workaround_all_evidence_dropped_collapses():
+    r, sha, _, _ = _first_commit_with_added_file("repo_squash")
+    adr = (
+        "---\ntype: workaround\n---\n\n# W\n\n## Evidence\n\n"
+        f'- bogus <!-- evidence: {sha} marker:"NEVER ADDED" -->\n'
+        f"\n## Links\n\n- Commits: {sha}\n"
+    )
+    result = judge.verify_adr(r, adr)
+    rendered = judge.render_verified_adr(adr, result, date="2026-06-10")
+    assert judge.NO_EVIDENCE_LINE in rendered
+    assert "bogus" not in rendered
+
+
+def test_madr_ignores_evidence_section():
+    """A plain MADR with an Evidence section still verifies Considered Options."""
+    r, sha, path, _ = _first_commit_with_added_file("repo_squash")
+    adr = (
+        "# D\n\n## Considered Options\n\n"
+        f"- good <!-- evidence: {sha} added:{path} -->\n\n"
+        "## Evidence\n\n- stray bullet with no citation\n\n"
+        f"## Links\n\n- Commits: {sha}\n"
+    )
+    result = judge.verify_adr(r, adr)
+    assert result["record_type"] == "madr"
+    assert {o["option"] for o in result["kept"]} == {"good"}
+    assert not result["dropped"]  # the Evidence bullet was not treated as an option

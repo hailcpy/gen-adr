@@ -156,6 +156,10 @@ def evidence_for_candidate(repo: str, candidate: dict) -> str:
 #   * **Redis** <!-- evidence: 3f4a2bc deleted:src/cache/redis_client.py -->
 #   * RabbitMQ   <!-- evidence: a1b2c3d message:instead of rabbitmq -->
 #   * Memcached  <!-- evidence: a1b2c3d removed:"import memcache" -->
+#   * HACK note  <!-- evidence: a1b2c3d marker:"HACK: drop after aws-sdk fix" -->
+#     (`marker:` = an ADDED line, the mirror of `removed:` — used by workaround
+#      records to pin the workaround's own comment/pin to the commit that
+#      introduced it)
 
 CITATION_RE = re.compile(
     r"<!--\s*evidence:\s*(?P<sha>[0-9a-fA-F]{7,40})\s+"
@@ -173,7 +177,34 @@ COMMITS_LINE_RE = re.compile(
 # line, which covers "code replaced inside a modified file" deterministically.
 # Anything whose type is none of these is treated as uncheckable and dropped
 # (the safe direction: never assert an option we cannot pin to the bytes).
-DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message", "removed"}
+DETERMINISTIC_TYPES = {"deleted", "added", "renamed", "message", "removed", "marker"}
+
+# --- record types ------------------------------------------------------------
+#
+# An ADR file declares its record type in YAML frontmatter (`type: workaround`);
+# absent/unknown -> classic MADR. The record type selects which section carries
+# the verifiable citations: a MADR's hallucination hot-spot is "Considered
+# Options", a workaround log's is "Evidence" (the marker/pin lines that prove
+# the workaround exists in the history).
+
+RECORD_TYPE_RE = re.compile(r"^type:\s*([\w-]+)\s*$", re.M)
+VERIFIABLE_SECTIONS = {"madr": "Considered Options", "workaround": "Evidence"}
+
+
+def record_type_of(adr_text: str) -> str:
+    """Record type from YAML frontmatter; 'madr' when absent or unknown."""
+    if adr_text.startswith("---\n"):
+        end = adr_text.find("\n---", 4)
+        if end != -1:
+            m = RECORD_TYPE_RE.search(adr_text[4:end])
+            if m and m.group(1).lower() in VERIFIABLE_SECTIONS:
+                return m.group(1).lower()
+    return "madr"
+
+
+def _section_re(rtype: str) -> "re.Pattern":
+    name = VERIFIABLE_SECTIONS.get(rtype, "Considered Options")
+    return re.compile(rf"^##\s+{re.escape(name)}\s*$", re.I | re.M)
 
 
 def extract_linked_shas(adr_text: str) -> list[str]:
@@ -243,9 +274,14 @@ class CitationVerdict:
     reason: str = ""
 
 
-def extract_cited_options(adr_text: str) -> list[CitedOption]:
-    """Parse '## Considered Options' bullets into (visible text, citation?)."""
-    m = OPTIONS_HEADER_RE.search(adr_text)
+def extract_cited_options(adr_text: str,
+                          header_re: Optional["re.Pattern"] = None) -> list[CitedOption]:
+    """Parse the verifiable section's bullets into (visible text, citation?).
+
+    `header_re` selects the section (default: '## Considered Options'); the
+    workaround record type verifies '## Evidence' instead — see _section_re.
+    """
+    m = (header_re or OPTIONS_HEADER_RE).search(adr_text)
     if not m:
         return []
     rest = adr_text[m.end():]
@@ -320,6 +356,16 @@ def verify_citation(repo: str, c: Citation, allowed_shas: Optional[list[str]] = 
                 return "verified", f"'{c.detail}' removed in {c.sha}"
         return "failed", f"'{c.detail}' not among removed lines in {c.sha}"
 
+    if c.etype == "marker":
+        # mirror of `removed:` over ADDED lines — pins a workaround's own
+        # marker comment / version pin to the commit that introduced it
+        diff = analyze.git(repo, "show", "--format=", "--unified=0", c.sha)
+        for line in diff.splitlines():
+            if line.startswith("+") and not line.startswith("+++") \
+                    and c.detail in line[1:]:
+                return "verified", f"'{c.detail}' added in {c.sha}"
+        return "failed", f"'{c.detail}' not among added lines in {c.sha}"
+
     want = c.detail
     for status, paths in _name_status(repo, c.sha):
         if c.etype == "deleted" and status == "D" and want in paths:
@@ -342,8 +388,9 @@ def verify_options(repo: str, adr_text: str, allowed_shas: Optional[list[str]] =
     verified — failed, uncited, or uncheckable type).
     """
     effective_allowed = _resolve_allowed(adr_text, allowed_shas)
+    rtype = record_type_of(adr_text)
 
-    cited = extract_cited_options(adr_text)
+    cited = extract_cited_options(adr_text, _section_re(rtype))
     verdicts: list[CitationVerdict] = []
     for co in cited:
         if co.citation is None:
@@ -358,6 +405,7 @@ def verify_options(repo: str, adr_text: str, allowed_shas: Optional[list[str]] =
         "overall": overall,
         "verdicts": [asdict(v) for v in verdicts],
         "scoped": effective_allowed is not None,
+        "record_type": rtype,
     }
 
 
@@ -372,7 +420,7 @@ def verify_options(repo: str, adr_text: str, allowed_shas: Optional[list[str]] =
 
 OPTIONS_HEADER_RE = re.compile(r"^##\s+Considered Options\s*$", re.I | re.M)
 NEXT_HEADER_RE = re.compile(r"^##\s+", re.M)
-NO_ALT_RE = re.compile(r"no alternatives recorded", re.I)
+NO_ALT_RE = re.compile(r"no alternatives recorded|no verifiable evidence recorded", re.I)
 LIST_ITEM_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.M)
 
 
@@ -542,12 +590,15 @@ def verify_adr(repo: str, adr_text: str, allowed_shas: Optional[list[str]] = Non
     anything else (failed structural check, no citation, or an uncheckable
     evidence type) -> dropped. Reproducible: same repo + text -> same result.
 
-    Returns a dict with a 'scoped' key: true iff a candidate set was in force.
+    Returns a dict with a 'scoped' key: true iff a candidate set was in force,
+    and a 'record_type' key ('madr' or 'workaround') selecting the verified
+    section: Considered Options for MADRs, Evidence for workaround logs.
     """
     effective_allowed = _resolve_allowed(adr_text, allowed_shas)
     scoped = effective_allowed is not None
+    rtype = record_type_of(adr_text)
 
-    cited = extract_cited_options(adr_text)
+    cited = extract_cited_options(adr_text, _section_re(rtype))
     outcomes: list[OptionOutcome] = []
 
     for co in cited:
@@ -567,15 +618,19 @@ def verify_adr(repo: str, adr_text: str, allowed_shas: Optional[list[str]] = Non
         "dropped": [asdict(o) for o in dropped],
         "had_options": bool(cited),
         "scoped": scoped,
+        "record_type": rtype,
     }
 
 
 NO_ALT_LINE = "No alternatives recorded in commit history."
+NO_EVIDENCE_LINE = "No verifiable evidence recorded."
+_EMPTY_SECTION_LINE = {"madr": NO_ALT_LINE, "workaround": NO_EVIDENCE_LINE}
 
 
-def _replace_options_section(adr_text: str, new_body: str) -> str:
-    """Swap the body of the '## Considered Options' section, headers preserved."""
-    m = OPTIONS_HEADER_RE.search(adr_text)
+def _replace_options_section(adr_text: str, new_body: str,
+                             header_re: Optional["re.Pattern"] = None) -> str:
+    """Swap the body of the verifiable section, headers preserved."""
+    m = (header_re or OPTIONS_HEADER_RE).search(adr_text)
     if not m:
         return adr_text
     rest = adr_text[m.end():]
@@ -653,12 +708,13 @@ def render_verified_adr(adr_text: str, result: dict,
         ])
         return re.sub(r"\n{3,}", "\n\n", out)  # collapse blank-line artifacts
 
+    rtype = result.get("record_type", "madr")
     kept = result["kept"]
     if kept:
         body = "\n".join(f"- {o['raw']}" for o in kept)
     else:
-        body = NO_ALT_LINE
-    out = _replace_options_section(adr_text, body)
+        body = _EMPTY_SECTION_LINE.get(rtype, NO_ALT_LINE)
+    out = _replace_options_section(adr_text, body, _section_re(rtype))
 
     out = _upsert_frontmatter(out, [
         "generation:",
