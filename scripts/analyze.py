@@ -411,6 +411,8 @@ _VERSION_LINE_PATTERNS = [
     re.compile(r'^[+-]\s*[\w_-]+\s*=\s*"[~^>=<]?\s*\d+(\.\d+){0,2}(-[\w.]+)?"\s*$'),
     re.compile(r'^[+-]\s*[\w_-]+\s*[=<>!~]+\s*\d+(\.\d+){0,2}\s*$'),
     re.compile(r'^[+-]\s*[\w./_-]+\s+v\d+(\.\d+){0,2}\s*$'),
+    # PEP-621 array entry, e.g. `"requests>=2.31",` in a `dependencies = [...]` array
+    re.compile(r'^[+-]\s*"[A-Za-z0-9_.\[\]-]+\s*[=<>!~]+\s*[\d][^"]*"\s*,?\s*$'),
 ]
 # captures the package name from a version line (group 1), one per manifest shape
 _VERSION_KEY_PATTERNS = [
@@ -418,6 +420,7 @@ _VERSION_KEY_PATTERNS = [
     re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*=\s*"[~^>=<]?\d'),  # pyproject/cargo TOML
     re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*[=<>!~]+\s*\d'),    # requirements.txt
     re.compile(r'^[+-]\s*([\w./_-]+)\s+v\d'),                    # go.mod
+    re.compile(r'^[+-]\s*"([A-Za-z0-9_.\[\]-]+)\s*[=<>!~]'),     # PEP-621 dependency array
 ]
 
 
@@ -1349,6 +1352,18 @@ def classify(
         if repo and chunk_range:
             base, head = chunk_range
             confirmed = is_pure_version_bump(repo, base, head, dep_changed)
+        elif repo:
+            # No aggregate diff range (multi-chunk cluster or direct-commit
+            # candidate) — verify per-commit instead of assuming. Each
+            # commit's own files are a subset of dep_changed (only_dep_bump
+            # already established every touched file is a dep manifest).
+            confirmed = all(
+                is_pure_version_bump(
+                    repo, f"{c.sha}^" if c.parents else _EMPTY_TREE, c.sha,
+                    [f.path for f in c.files],
+                )
+                for c in commits
+            )
         else:
             confirmed = True
         if confirmed:
