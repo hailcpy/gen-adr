@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import difflib
 import json
 import re
 import subprocess
@@ -49,10 +51,6 @@ _COUPLING_DENY_RE = re.compile(
     r"|(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|poetry\.lock|cargo\.lock|gemfile\.lock|composer\.lock)$",
     re.I,
 )
-# A commit touching more files than this after filtering is a large refactor
-# or merge dump — its co-change signal is unreliable, so skip pair enumeration
-# for it entirely rather than pay O(k^2).
-_MAX_COUPLING_FILES_PER_COMMIT = 200
 
 # auto-tuned edge specificity (see Config.auto_specificity)
 AUTO_SPEC_MIN_COMMITS = 50   # below this, hotness isn't meaningful → no-op
@@ -227,6 +225,12 @@ class Config:
     # auto_specificity=False, to opt out. Below AUTO_SPEC_MIN_COMMITS it is a
     # no-op, so the small-fixture eval baseline is unchanged.
     auto_specificity: bool = True
+    # co-change coupling: commits touching more than this many files (after the
+    # lockfile/vendor/generated deny-filter) carry no reliable coupling signal
+    # and are skipped for pair enumeration entirely. Mirrors code-maat's
+    # --max-changeset-size (default 30) — without it, a single mega-commit
+    # generates O(k^2) pair increments and dominates build_coupling's runtime.
+    coupling_max_changeset: int = 30
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
@@ -241,6 +245,19 @@ class Config:
     generic_basenames: frozenset = DEFAULT_GENERIC_BASENAMES
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
+    # all top-level keys recognized by from_file, for unknown-key detection
+    _KNOWN_KEYS = frozenset({
+        "min_dir_depth", "cluster_cap", "split_oversized",
+        "file_df_max", "token_df_max", "dir_df_max",
+        "auto_specificity", "coupling_max_changeset", "detect_workarounds",
+        "score_arch_threshold", "score_borderline_threshold",
+        "extra_workaround_markers",
+        "stopwords", "extra_stopwords",
+        "generic_basenames", "extra_generic_basenames",
+        "source_roots", "extra_source_roots",
+        "weights",
+    })
+
     @classmethod
     def from_file(cls, path: Optional[str]) -> "Config":
         if not path:
@@ -248,9 +265,15 @@ class Config:
         with open(path) as fh:
             raw = json.load(fh)
         cfg = cls()
+        for key in raw:
+            if key not in cls._KNOWN_KEYS:
+                close = difflib.get_close_matches(key, cls._KNOWN_KEYS, n=1)
+                hint = f" — did you mean {close[0]!r}?" if close else ""
+                print(f"warning: unknown config key {key!r}{hint}", file=sys.stderr)
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
                     "file_df_max", "token_df_max", "dir_df_max",
-                    "auto_specificity", "detect_workarounds",
+                    "auto_specificity", "coupling_max_changeset",
+                    "detect_workarounds",
                     "score_arch_threshold", "score_borderline_threshold"):
             if key in raw:
                 setattr(cfg, key, raw[key])
@@ -411,6 +434,8 @@ _VERSION_LINE_PATTERNS = [
     re.compile(r'^[+-]\s*[\w_-]+\s*=\s*"[~^>=<]?\s*\d+(\.\d+){0,2}(-[\w.]+)?"\s*$'),
     re.compile(r'^[+-]\s*[\w_-]+\s*[=<>!~]+\s*\d+(\.\d+){0,2}\s*$'),
     re.compile(r'^[+-]\s*[\w./_-]+\s+v\d+(\.\d+){0,2}\s*$'),
+    # PEP-621 array entry, e.g. `"requests>=2.31",` in a `dependencies = [...]` array
+    re.compile(r'^[+-]\s*"[A-Za-z0-9_.\[\]-]+\s*[=<>!~]+\s*[\d][^"]*"\s*,?\s*$'),
 ]
 # captures the package name from a version line (group 1), one per manifest shape
 _VERSION_KEY_PATTERNS = [
@@ -418,6 +443,7 @@ _VERSION_KEY_PATTERNS = [
     re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*=\s*"[~^>=<]?\d'),  # pyproject/cargo TOML
     re.compile(r'^[+-]\s*([A-Za-z0-9_.-]+)\s*[=<>!~]+\s*\d'),    # requirements.txt
     re.compile(r'^[+-]\s*([\w./_-]+)\s+v\d'),                    # go.mod
+    re.compile(r'^[+-]\s*"([A-Za-z0-9_.\[\]-]+)\s*[=<>!~]'),     # PEP-621 dependency array
 ]
 
 
@@ -525,12 +551,22 @@ def parse_log(repo: str, rev_range: Optional[str], pathspec: Optional[str],
     return commits
 
 
-def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
+def detect_strategy(repo: str, pathspec: Optional[str],
+                    rev_range: Optional[str] = None) -> str:
+    """Detect chunking strategy from merge/squash shape.
+
+    Scoped to `rev_range` when given (a `since:<ref>` window) — otherwise a
+    repo that switched chunking style long ago would be classified by its
+    full, mostly-irrelevant history rather than the window being analyzed.
+    """
+    rev_args = [rev_range] if rev_range else []
     merge_count = len([l for l in git(
         repo, "log", "--merges", "--oneline",
+        *rev_args,
         *(["--", pathspec] if pathspec else [])
     ).splitlines() if l.strip()])
     subjects = git(repo, "log", "--no-merges", "--pretty=format:%s",
+                   *rev_args,
                    *(["--", pathspec] if pathspec else [])).splitlines()
     squash_count = sum(1 for s in subjects if PR_REF_RE.search(s))
 
@@ -550,7 +586,8 @@ _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 def enumerate_merge_chunks(
-    repo: str, pathspec: Optional[str]
+    repo: str, pathspec: Optional[str],
+    rev_range: Optional[str] = None, valid_shas: Optional[set] = None,
 ) -> list[tuple[str, str, list[Commit]]]:
     """For each merge commit on the current branch return (merge_sha, base_sha, commits_in_pr).
 
@@ -558,9 +595,16 @@ def enumerate_merge_chunks(
       base = git merge-base p1 p2
       commits_in_pr = parse_log over base..M with no_merges=True
 
+    `rev_range` scopes which merge commits are considered (e.g. `since:<ref>`
+    windows). `valid_shas`, when given, additionally filters commits_in_pr so
+    a merge that pulls in pre-window history doesn't leak those commits into
+    the chunk — keeping `since:` a hard history boundary.
+
     Returns chunks in chronological order (earliest merge first).
     """
     fmt_args = ["log", "--merges", "--pretty=format:%H|%P|%cd", "--date=short"]
+    if rev_range:
+        fmt_args.append(rev_range)
     if pathspec:
         fmt_args += ["--", pathspec]
     raw = git(repo, *fmt_args)
@@ -589,6 +633,8 @@ def enumerate_merge_chunks(
             pathspec=pathspec,
             no_merges=True,
         )
+        if valid_shas is not None:
+            pr_commits = [c for c in pr_commits if c.sha in valid_shas]
         result.append((merge_sha, base_sha, pr_commits))
 
     return result
@@ -603,12 +649,18 @@ def chunk_commits(
     coupling: Optional[dict] = None,
     communities: Optional[dict] = None,
     spec: Optional["Specificity"] = None,
+    rev_range: Optional[str] = None,
 ) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]]]:
     """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster().
 
     Returns (chunks, chunk_ranges) where chunk_ranges maps chunk index to an
     optional (base_sha, head_sha) diff range for that chunk.
+
+    `rev_range`, when given (a `since:<ref>` window), is passed through to
+    merge chunk enumeration so merge-boundary/mixed strategies don't pull
+    pre-window merges and commits into the candidate set.
     """
+    valid_shas = {c.sha for c in commits} if rev_range else None
     if strategy == "squash-boundary":
         chunks = [[c] for c in commits]
         ranges: dict[int, Optional[tuple[str, str]]] = {}
@@ -620,7 +672,7 @@ def chunk_commits(
         return chunks, ranges
 
     if strategy == "merge-boundary":
-        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        merge_chunks = enumerate_merge_chunks(repo, pathspec, rev_range, valid_shas)
         chunks = []
         ranges = {}
         seen: set[str] = set()
@@ -637,7 +689,7 @@ def chunk_commits(
         return chunks, ranges
 
     if strategy == "mixed":
-        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        merge_chunks = enumerate_merge_chunks(repo, pathspec, rev_range, valid_shas)
         chunks = []
         ranges = {}
         seen: set[str] = set()
@@ -651,16 +703,25 @@ def chunk_commits(
                 idx = len(chunks)
                 chunks.append(chunk)
                 ranges[idx] = (base_sha, merge_sha)
-        # squash-style commits not covered by any merge range
-        for c in commits:
-            if c.sha not in seen:
-                seen.add(c.sha)
+        # commits not covered by any merge range: affinity-group them, same as
+        # direct-commit mode, instead of leaving each as an ungrouped singleton
+        # (a linear stretch of related commits would otherwise only merge if
+        # cluster() catches it later, which needs the 2-of-4 signal bar to fire
+        # pairwise on singletons).
+        leftover = [c for c in commits if c.sha not in seen]
+        if leftover:
+            for group in _affinity_groups(leftover, cfg, coupling=coupling,
+                                          communities=communities, spec=spec):
                 idx = len(chunks)
-                chunks.append([c])
-                if c.parents:
-                    ranges[idx] = (f"{c.sha}^", c.sha)
+                chunks.append(group)
+                if len(group) == 1:
+                    c = group[0]
+                    if c.parents:
+                        ranges[idx] = (f"{c.sha}^", c.sha)
+                    else:
+                        ranges[idx] = (_EMPTY_TREE, c.sha)
                 else:
-                    ranges[idx] = (_EMPTY_TREE, c.sha)
+                    ranges[idx] = None
         return chunks, ranges
 
     # direct-commit: affinity groups — no clean diff range per group
@@ -673,7 +734,8 @@ def chunk_commits(
     return aff_chunks, aff_ranges
 
 
-def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
+def build_coupling(repo: str, pathspec: Optional[str] = None,
+                   cfg: Optional[Config] = None) -> dict:
     """Return frozenset({fileA, fileB}) → Jaccard coupling score over full history.
 
     Only pairs with ≥COUPLING_MIN_SHARED co-appearances and a score
@@ -681,6 +743,7 @@ def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
     Always mines the full history regardless of the analysis rev_range, since
     coupling is a global prior, not scoped to the current window.
     """
+    cfg = cfg or Config()
     commits = parse_log(repo, rev_range=None, pathspec=pathspec, no_merges=True)
     file_revs: dict[str, int] = {}
     pair_revs: dict = {}
@@ -689,7 +752,7 @@ def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
         for p in paths:
             file_revs[p] = file_revs.get(p, 0) + 1
         paths = [p for p in paths if not _COUPLING_DENY_RE.search(p)]
-        if len(paths) > _MAX_COUPLING_FILES_PER_COMMIT:
+        if len(paths) > cfg.coupling_max_changeset:
             continue
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
@@ -1349,6 +1412,18 @@ def classify(
         if repo and chunk_range:
             base, head = chunk_range
             confirmed = is_pure_version_bump(repo, base, head, dep_changed)
+        elif repo:
+            # No aggregate diff range (multi-chunk cluster or direct-commit
+            # candidate) — verify per-commit instead of assuming. Each
+            # commit's own files are a subset of dep_changed (only_dep_bump
+            # already established every touched file is a dep manifest).
+            confirmed = all(
+                is_pure_version_bump(
+                    repo, f"{c.sha}^" if c.parents else _EMPTY_TREE, c.sha,
+                    [f.path for f in c.files],
+                )
+                for c in commits
+            )
         else:
             confirmed = True
         if confirmed:
@@ -1440,8 +1515,12 @@ def output_dir_for(code_scope: str) -> str:
 
 
 def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
-            cfg: Optional[Config] = None) -> dict:
-    cfg = cfg or Config()
+            cfg: Optional[Config] = None, strategy: str = "auto") -> dict:
+    # Work on a copy: analyze() sets several run-scoped fields (module_prefix,
+    # resolved source_roots, auto-tuned specificity caps) on cfg. Mutating the
+    # caller's object would leak this run's state into a second analyze() call
+    # that reuses the same Config (e.g. analyzing two modules in a loop).
+    cfg = copy.copy(cfg) if cfg is not None else Config()
     pathspec = None
     if code_scope.startswith("module:"):
         pathspec = code_scope.split(":", 1)[1]
@@ -1501,9 +1580,13 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         cfg.source_roots = sorted(set(cfg.source_roots) | set(cfg.extra_source_roots))
     preflight["source_roots"] = cfg.source_roots
 
-    strategy = detect_strategy(repo, pathspec)
+    # `strategy="auto"` (the default) detects from merge/squash shape; any other
+    # value bypasses detection entirely, e.g. to force direct-commit chunking on
+    # a merge-heavy repo.
+    effective_strategy = (detect_strategy(repo, pathspec, rev_range)
+                          if strategy == "auto" else strategy)
     commits = parse_log(repo, rev_range, pathspec)
-    coupling = build_coupling(repo, pathspec)
+    coupling = build_coupling(repo, pathspec, cfg)
     communities = build_leiden_communities(repo)
     # auto-tune edge specificity from history size unless overridden
     cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max = \
@@ -1511,9 +1594,10 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     preflight["specificity_cap"] = cfg.file_df_max
     spec = build_specificity(commits, cfg)
     chunks, chunk_ranges = chunk_commits(
-        commits, strategy, cfg,
+        commits, effective_strategy, cfg,
         repo=repo, pathspec=pathspec,
         coupling=coupling, communities=communities, spec=spec,
+        rev_range=rev_range,
     )
     clusters, cluster_ranges, cluster_split_reasons, cluster_merge_reasons = cluster(
         chunks, cfg,
@@ -1559,7 +1643,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         "repo": repo,
         "scope": {"history": history_scope, "code": code_scope},
         "preflight": preflight,
-        "strategy": strategy,
+        "strategy": effective_strategy,
         "candidates": [asdict(c) for c in candidates],
     }
 
@@ -1571,6 +1655,10 @@ def main() -> int:
     ap.add_argument("--code", default="repo")
     ap.add_argument("--config", default=None,
                     help="path to a JSON config of pipeline knobs (see Config)")
+    ap.add_argument("--strategy", default="auto",
+                    choices=["auto", "merge-boundary", "squash-boundary",
+                             "direct-commit", "mixed"],
+                    help="override chunking strategy detection (default: auto-detect)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -1579,7 +1667,7 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as e:
         print(f"error: could not load config {args.config!r}: {e}", file=sys.stderr)
         return 2
-    manifest = analyze(args.repo, args.history, args.code, cfg)
+    manifest = analyze(args.repo, args.history, args.code, cfg, args.strategy)
     if args.json:
         print(json.dumps(manifest, indent=2))
     else:

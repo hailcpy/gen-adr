@@ -145,6 +145,42 @@ def test_is_pure_version_bump_false_for_pyproject_swap():
         assert not analyze.is_pure_version_bump(tmp, base, head, ["pyproject.toml"])
 
 
+def test_is_pure_version_bump_true_for_pep621_array():
+    """PEP-621 `dependencies = [...]` array entries are quoted PEP-508 specifiers,
+    not `key = "value"` pairs — issue #44."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[project]\ndependencies = [\n  "requests>=2.31",\n  "pydantic>=2.6",\n]\n')
+        _commit(tmp, "init", "2024-01-01")
+        base = _head(tmp)
+
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[project]\ndependencies = [\n  "requests>=2.32",\n  "pydantic>=2.6",\n]\n')
+        _commit(tmp, "chore: bump requests", "2024-01-02")
+        head = _head(tmp)
+
+        assert analyze.is_pure_version_bump(tmp, base, head, ["pyproject.toml"])
+
+
+def test_is_pure_version_bump_false_for_pep621_array_swap():
+    """A package added/renamed inside a PEP-621 array must NOT be a pure bump —
+    the key-set check still fires."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[project]\ndependencies = [\n  "requests>=2.31",\n]\n')
+        _commit(tmp, "init", "2024-01-01")
+        base = _head(tmp)
+
+        with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+            f.write('[project]\ndependencies = [\n  "httpx>=0.27",\n]\n')
+        _commit(tmp, "chore: swap requests for httpx", "2024-01-02")
+        head = _head(tmp)
+
+        assert not analyze.is_pure_version_bump(tmp, base, head, ["pyproject.toml"])
+
+
 # ---------------------------------------------------------------------------
 # Gap B — classify skips / keeps based on diff content
 # ---------------------------------------------------------------------------
@@ -167,6 +203,66 @@ def test_classify_skips_real_version_bump():
         _, cls, signals = analyze.classify(
             commits, analyze.Config(),
             repo=tmp, chunk_range=(base, head),
+        )
+        assert cls == "skip"
+        assert any("version bump" in s for s in signals)
+
+
+def test_classify_no_range_keeps_clustered_dep_replacement():
+    """Issue #37: when chunk_range is None (multi-chunk cluster / direct-commit),
+    a dependency *replacement* spread across two chore: commits must NOT be
+    force-excluded as a version bump — it must be verified per-commit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {\n    "moment": "^2.29.0"\n  }\n}\n')
+        _commit(tmp, "init", "2024-01-01")
+
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {}\n}\n')
+        _commit(tmp, "chore: drop moment", "2024-01-02")
+
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {\n    "date-fns": "^2.30.0"\n  }\n}\n')
+        _commit(tmp, "chore: add date-fns", "2024-01-03")
+        head = _head(tmp)
+
+        commits = analyze.parse_log(tmp, rev_range=f"{head}~2..{head}", pathspec=None)
+        assert len(commits) == 2
+        _, cls, signals = analyze.classify(
+            commits, analyze.Config(), repo=tmp, chunk_range=None,
+        )
+        assert not any("version bump" in s for s in signals)
+
+
+def test_classify_no_range_skips_clustered_pure_bumps():
+    """Issue #37: clustered commits that each only move version literals stay
+    excluded even with chunk_range=None."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {\n'
+                    '    "lodash": "^4.17.20",\n'
+                    '    "axios": "^1.6.0"\n  }\n}\n')
+        _commit(tmp, "init", "2024-01-01")
+
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {\n'
+                    '    "lodash": "^4.17.21",\n'
+                    '    "axios": "^1.6.0"\n  }\n}\n')
+        _commit(tmp, "chore: bump lodash", "2024-01-02")
+
+        with open(os.path.join(tmp, "package.json"), "w") as f:
+            f.write('{\n  "dependencies": {\n'
+                    '    "lodash": "^4.17.21",\n'
+                    '    "axios": "^1.6.1"\n  }\n}\n')
+        _commit(tmp, "chore: bump axios", "2024-01-03")
+        head = _head(tmp)
+
+        commits = analyze.parse_log(tmp, rev_range=f"{head}~2..{head}", pathspec=None)
+        assert len(commits) == 2
+        _, cls, signals = analyze.classify(
+            commits, analyze.Config(), repo=tmp, chunk_range=None,
         )
         assert cls == "skip"
         assert any("version bump" in s for s in signals)
