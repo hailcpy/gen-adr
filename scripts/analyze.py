@@ -586,7 +586,8 @@ _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 def enumerate_merge_chunks(
-    repo: str, pathspec: Optional[str]
+    repo: str, pathspec: Optional[str],
+    rev_range: Optional[str] = None, valid_shas: Optional[set] = None,
 ) -> list[tuple[str, str, list[Commit]]]:
     """For each merge commit on the current branch return (merge_sha, base_sha, commits_in_pr).
 
@@ -594,9 +595,16 @@ def enumerate_merge_chunks(
       base = git merge-base p1 p2
       commits_in_pr = parse_log over base..M with no_merges=True
 
+    `rev_range` scopes which merge commits are considered (e.g. `since:<ref>`
+    windows). `valid_shas`, when given, additionally filters commits_in_pr so
+    a merge that pulls in pre-window history doesn't leak those commits into
+    the chunk — keeping `since:` a hard history boundary.
+
     Returns chunks in chronological order (earliest merge first).
     """
     fmt_args = ["log", "--merges", "--pretty=format:%H|%P|%cd", "--date=short"]
+    if rev_range:
+        fmt_args.append(rev_range)
     if pathspec:
         fmt_args += ["--", pathspec]
     raw = git(repo, *fmt_args)
@@ -625,6 +633,8 @@ def enumerate_merge_chunks(
             pathspec=pathspec,
             no_merges=True,
         )
+        if valid_shas is not None:
+            pr_commits = [c for c in pr_commits if c.sha in valid_shas]
         result.append((merge_sha, base_sha, pr_commits))
 
     return result
@@ -639,12 +649,18 @@ def chunk_commits(
     coupling: Optional[dict] = None,
     communities: Optional[dict] = None,
     spec: Optional["Specificity"] = None,
+    rev_range: Optional[str] = None,
 ) -> tuple[list[list[Commit]], dict[int, Optional[tuple[str, str]]]]:
     """Group commits WITHIN boundaries. Cross-boundary merging happens in cluster().
 
     Returns (chunks, chunk_ranges) where chunk_ranges maps chunk index to an
     optional (base_sha, head_sha) diff range for that chunk.
+
+    `rev_range`, when given (a `since:<ref>` window), is passed through to
+    merge chunk enumeration so merge-boundary/mixed strategies don't pull
+    pre-window merges and commits into the candidate set.
     """
+    valid_shas = {c.sha for c in commits} if rev_range else None
     if strategy == "squash-boundary":
         chunks = [[c] for c in commits]
         ranges: dict[int, Optional[tuple[str, str]]] = {}
@@ -656,7 +672,7 @@ def chunk_commits(
         return chunks, ranges
 
     if strategy == "merge-boundary":
-        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        merge_chunks = enumerate_merge_chunks(repo, pathspec, rev_range, valid_shas)
         chunks = []
         ranges = {}
         seen: set[str] = set()
@@ -673,7 +689,7 @@ def chunk_commits(
         return chunks, ranges
 
     if strategy == "mixed":
-        merge_chunks = enumerate_merge_chunks(repo, pathspec)
+        merge_chunks = enumerate_merge_chunks(repo, pathspec, rev_range, valid_shas)
         chunks = []
         ranges = {}
         seen: set[str] = set()
@@ -1581,6 +1597,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         commits, effective_strategy, cfg,
         repo=repo, pathspec=pathspec,
         coupling=coupling, communities=communities, spec=spec,
+        rev_range=rev_range,
     )
     clusters, cluster_ranges, cluster_split_reasons, cluster_merge_reasons = cluster(
         chunks, cfg,

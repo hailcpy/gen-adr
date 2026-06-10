@@ -100,6 +100,49 @@ def test_detect_strategy_scoped_to_rev_range():
         assert scoped == "squash-boundary"  # no merges in this window
 
 
+def test_merge_chunk_enumeration_scoped_to_rev_range():
+    """A merge from before the `since:<ref>` window must not leak its commits
+    (or files) into the candidate set, even when later merges select
+    merge-boundary chunking for the scoped run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _init_repo(tmp)
+        with open(os.path.join(tmp, "README.md"), "w") as f:
+            f.write("init\n")
+        _commit(tmp, "init", "2024-01-01")
+
+        # pre-v1 merge bringing in src/old.py
+        os.makedirs(os.path.join(tmp, "src"), exist_ok=True)
+        _sh("git", "checkout", "-q", "-b", "old-feature", cwd=tmp)
+        with open(os.path.join(tmp, "src", "old.py"), "w") as f:
+            f.write("old\n")
+        _commit(tmp, "feat: old feature", "2024-01-02")
+        _sh("git", "checkout", "-q", "main", cwd=tmp)
+        _sh("git", "merge", "--no-ff", "-q", "-m", "Merge old feature", "old-feature",
+            cwd=tmp, env=_date_env("2024-01-02"))
+
+        _sh("git", "tag", "v1", cwd=tmp)
+
+        # post-v1: 3 merges, no squash-style subjects -> merge-boundary
+        for i in range(3):
+            branch = f"feature{i}"
+            _sh("git", "checkout", "-q", "-b", branch, cwd=tmp)
+            with open(os.path.join(tmp, "src", f"new{i}.py"), "w") as f:
+                f.write("new\n")
+            _commit(tmp, f"feat: new feature {i}", f"2024-02-0{i + 1}")
+            _sh("git", "checkout", "-q", "main", cwd=tmp)
+            _sh("git", "merge", "--no-ff", "-q", "-m", f"Merge feature {i}", branch,
+                cwd=tmp, env=_date_env(f"2024-02-0{i + 1}"))
+
+        scoped = analyze.detect_strategy(tmp, pathspec=None, rev_range="v1..HEAD")
+        assert scoped == "merge-boundary"
+
+        result = analyze.analyze(tmp, history_scope="since:v1")
+        assert result["strategy"] == "merge-boundary"
+
+        all_files = {f for c in result["candidates"] for f in c["files"]}
+        assert "src/old.py" not in all_files
+
+
 # ---------------------------------------------------------------------------
 # issue #38: mixed strategy groups leftover linear commits; --strategy override
 # ---------------------------------------------------------------------------
