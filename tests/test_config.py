@@ -103,6 +103,51 @@ def test_from_file_bare_set_replaces(tmp_path):
     assert cfg.stopwords == frozenset({"only", "these"})
 
 
+def test_from_file_unknown_key_warns(tmp_path, capsys):
+    """Issue #40: a typo'd config key is a silent no-op otherwise — warn to
+    stderr, with a close-match hint when one exists."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"file_dfmax": 4}))
+    cfg = Config.from_file(str(p))
+    assert cfg.file_df_max is None  # unknown key has no effect
+    err = capsys.readouterr().err
+    assert "unknown config key" in err
+    assert "file_dfmax" in err
+    assert "file_df_max" in err  # close-match hint
+
+
+def test_from_file_known_keys_no_warning(tmp_path, capsys):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"cluster_cap": 3, "extra_stopwords": ["zzz"]}))
+    Config.from_file(str(p))
+    assert capsys.readouterr().err == ""
+
+
+# --- analyze() does not mutate the caller's Config ---------------------------
+
+def test_analyze_does_not_mutate_config():
+    """Issue #40: analyze() sets module_prefix, source_roots, and the
+    auto-tuned specificity caps at runtime — these must land on a copy, not
+    the caller's Config, so a reused Config doesn't leak state across runs."""
+    cfg = Config()
+    analyze.analyze(repo("repo_modules"), code_scope="module:moduleA", cfg=cfg)
+    assert cfg.module_prefix == ""
+    assert cfg.source_roots is None
+    assert cfg.file_df_max is None
+    assert cfg.token_df_max is None
+    assert cfg.dir_df_max is None
+
+
+def test_analyze_repeated_calls_with_shared_config_are_identical():
+    """Calling analyze() twice with the same Config object yields the same
+    result as two fresh Configs (issue #40 acceptance)."""
+    shared = Config()
+    first = analyze.analyze(repo("repo_modules"), code_scope="module:moduleA", cfg=shared)
+    second = analyze.analyze(repo("repo_modules"), code_scope="module:moduleB", cfg=shared)
+    fresh_second = analyze.analyze(repo("repo_modules"), code_scope="module:moduleB", cfg=Config())
+    assert second["candidates"] == fresh_second["candidates"]
+
+
 # --- edge specificity (hot-file / IDF de-chaining) ---------------------------
 
 def _home(cands, marker):

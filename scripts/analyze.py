@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import difflib
 import json
 import re
 import subprocess
@@ -241,6 +243,19 @@ class Config:
     generic_basenames: frozenset = DEFAULT_GENERIC_BASENAMES
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
+    # all top-level keys recognized by from_file, for unknown-key detection
+    _KNOWN_KEYS = frozenset({
+        "min_dir_depth", "cluster_cap", "split_oversized",
+        "file_df_max", "token_df_max", "dir_df_max",
+        "auto_specificity", "detect_workarounds",
+        "score_arch_threshold", "score_borderline_threshold",
+        "extra_workaround_markers",
+        "stopwords", "extra_stopwords",
+        "generic_basenames", "extra_generic_basenames",
+        "source_roots", "extra_source_roots",
+        "weights",
+    })
+
     @classmethod
     def from_file(cls, path: Optional[str]) -> "Config":
         if not path:
@@ -248,6 +263,11 @@ class Config:
         with open(path) as fh:
             raw = json.load(fh)
         cfg = cls()
+        for key in raw:
+            if key not in cls._KNOWN_KEYS:
+                close = difflib.get_close_matches(key, cls._KNOWN_KEYS, n=1)
+                hint = f" — did you mean {close[0]!r}?" if close else ""
+                print(f"warning: unknown config key {key!r}{hint}", file=sys.stderr)
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
                     "file_df_max", "token_df_max", "dir_df_max",
                     "auto_specificity", "detect_workarounds",
@@ -1456,7 +1476,11 @@ def output_dir_for(code_scope: str) -> str:
 
 def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             cfg: Optional[Config] = None) -> dict:
-    cfg = cfg or Config()
+    # Work on a copy: analyze() sets several run-scoped fields (module_prefix,
+    # resolved source_roots, auto-tuned specificity caps) on cfg. Mutating the
+    # caller's object would leak this run's state into a second analyze() call
+    # that reuses the same Config (e.g. analyzing two modules in a loop).
+    cfg = copy.copy(cfg) if cfg is not None else Config()
     pathspec = None
     if code_scope.startswith("module:"):
         pathspec = code_scope.split(":", 1)[1]
