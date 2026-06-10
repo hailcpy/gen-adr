@@ -48,9 +48,9 @@ Throughout the rest of this skill, `docs/decisions/` refers to the **scope-resol
 1. DETECT     → chunking strategy (merge / squash / rebase / direct)
 2. CHUNK      → group commits within boundaries into logical units
 2.5 CLUSTER   → merge related chunks ACROSS boundaries into decision candidates
-3. CLASSIFY   → filter architectural decisions from noise
-4. GENERATE   → produce MADR per decision candidate (batch-aware)
-5. TAG        → place @ADR inline markers in code
+3. CLASSIFY   → filter architectural decisions from noise + route record type
+4. GENERATE   → produce MADR (decision) or workaround log per candidate
+5. TAG        → place @ADR / @WA inline markers in code
 ```
  
 ### Quick mode (default for repos under ~500 commits)
@@ -58,7 +58,7 @@ Throughout the rest of this skill, `docs/decisions/` refers to the **scope-resol
 The full loop above earns its weight on large histories with many interleaved decisions. For a small/medium repo it is overkill — `analyze.py` already does the heavy lifting deterministically, so use it as a **scored classifier** and write from its output:
 
 1. Run once: `python3 scripts/analyze.py <repo> [--code module:<path>] --json`. With no `--config`, edge specificity auto-tunes from commit count, so clustering is sane out-of-box (no mega-cluster).
-2. Triage from the JSON directly — each candidate carries `score`, `classification`, and a `diff_summary` (files added/deleted/modified), so you can rank without running `git diff` by hand.
+2. Triage from the JSON directly — each candidate carries `score`, `classification`, `record_type` (`decision` | `workaround`), and a `diff_summary` (files added/deleted/modified), so you can rank without running `git diff` by hand. Candidates with `record_type: "workaround"` are generated from the workaround template regardless of their score class — a borderline `fix:` commit carrying a HACK marker is exactly what the workaround log exists for.
 3. Still honour the **Step 4 hard gate**: before writing each MADR, read the actual diff for that candidate (`diff_summary` is for triage, not a substitute). Write straight from the MADR template.
 4. Verify with `judge.py verify-adr` / `check-tags` as the safety net.
 5. Skip CHUNK/CLUSTER hand-curation and batch-generation choreography — they add no value at this scale.
@@ -450,6 +450,33 @@ python3 scripts/judge.py check-tags . <file1> <file2> ... --json
  
 ---
  
+## Workaround Logs (record_type: workaround)
+ 
+`analyze.py` flags candidates whose diffs carry workaround evidence — HACK/WORKAROUND/KLUDGE/XXX markers, monkeypatch/polyfill/shim wording, FIXME/TODO with until/upstream/temporary, or a workaround-shaped file (shim/adapter/polyfill, `patches/`, `*.patch`) — as `record_type: "workaround"` with the matched lines in `workaround_signals`. These get a **workaround log**, not a MADR. An architectural candidate that also carries markers stays a MADR (signal: `WORKAROUND: markers present`) — mention the workaround inside that ADR instead.
+ 
+**Routing rules:**
+ 
+| Aspect | Rule |
+|--------|------|
+| Template | `references/workaround-log-template.md` (Trigger / Workaround / Evidence / Scope / Removal Condition) |
+| Output | same scope-resolved `docs/decisions/` pool, same numbering sequence |
+| Filename | `NNNN-wa-<slug>.md` (the `-wa-` infix is the convention; `type:` frontmatter is the contract) |
+| Frontmatter | `type: workaround`, `status: active` |
+| Tag | `@WA-NNNN-<slug>: <summary> — see docs/decisions/NNNN-wa-<slug>.md` — ONE tag, at the workaround site itself |
+| Verification | same `judge.py verify-adr --commits ...` call — for `type: workaround` it verifies the **Evidence** section instead of Considered Options; cite added lines with `marker:"<exact line>"` |
+ 
+**The Removal Condition is the point.** A decision records *why*; a workaround records *until when*. Always extract a mechanical removal condition from the marker comment or commit message ("remove when aws-sdk >= 3.500"); if none is recoverable, write "No removal condition recorded — review periodically." Never invent one.
+ 
+**Lifecycle (re-runs and CI):**
+ 
+```bash
+python3 scripts/judge.py check-workarounds <repo> [--check-upstream] [--json]
+```
+ 
+Scans all `type: workaround` records: an `active` record whose cited `marker:` line is gone from the working tree is flagged "possibly removed — update status"; with `--check-upstream` (needs `gh`), a closed upstream issue linked in the record is flagged "removal condition may be met". The tool only reports — update `status:` to `removed`/`superseded` by hand after confirming.
+ 
+---
+ 
 ## Autonomous Mode Summary
  
 Print at the end:
@@ -466,7 +493,8 @@ Chunks found:   23
   Borderline:    4  (skipped — use assisted mode to review)
   Skipped:       11
 ADRs written:   8  (docs/decisions/0004–0011)
-Tags placed:    19 markers across 12 files
+Workaround logs: 2  (docs/decisions/0012-wa-*, 0013-wa-*)
+Tags placed:    19 @ADR + 2 @WA markers across 13 files
 Skipped tagging: 2 files (JSON — no comment syntax)
 ```
  
@@ -490,3 +518,4 @@ Skipped tagging: 2 files (JSON — no comment syntax)
  
 - `references/madr-examples.md` — 2 full worked examples: one with evidenced alternatives, one with none
 - `references/language-tag-patterns.md` — comment syntax edge cases (decorators, JSDoc, annotation processors)
+- `references/workaround-log-template.md` — workaround log template, worked example, status lifecycle, @WA tagging

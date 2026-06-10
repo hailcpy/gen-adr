@@ -117,6 +117,22 @@ REPLACE_WORDS = re.compile(r"\b(migrate|replace|adopt|switch|introduce|implement
 DEMOTE_PREFIX = re.compile(r"^(fix|chore|style|bump)\b", re.I)
 EXCLUDE_PREFIX = re.compile(r"^(test|docs|lint|format)\b", re.I)
 
+# --- workaround detection ------------------------------------------------------
+# Workarounds are evidenced by diff CONTENT (the marker comment, the pin, the
+# shim), not by file topology — a separate signal class from the architectural
+# score, not another threshold. A strong hit (marker in an added line, or a
+# workaround-shaped file) flips the candidate's record_type to "workaround";
+# message wording alone is recorded as a signal but never flips ("work around"
+# in prose can describe anything).
+WORKAROUND_STRONG_RE = re.compile(
+    r"\b(hack|work.?around|kludge|xxx)\b|monkey.?patch|\bpolyfill\b|\bshim\b", re.I)
+WORKAROUND_COND_RE = re.compile(
+    r"\b(fixme|todo)\b.*\b(until|upstream|remove (when|once|after)|temporar)", re.I)
+WORKAROUND_FILE_RE = re.compile(
+    r"(^|/)patches?(/|$)|\.(patch|diff)$|(adapter|proxy|shim|polyfill)[^/]*$", re.I)
+WORKAROUND_MAX_COMMITS = 20   # commits scanned per candidate
+WORKAROUND_MAX_LINES = 4000   # added diff lines scanned per candidate
+
 
 # --- source root detection ---------------------------------------------------
 
@@ -214,6 +230,9 @@ class Config:
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
+    # workaround detection (record_type routing; see scan_workarounds)
+    detect_workarounds: bool = True
+    extra_workaround_markers: list = field(default_factory=list)  # regex strings
     # source root detection
     source_roots: Optional[list] = None  # None = auto-detect at analyze() time
     extra_source_roots: list = field(default_factory=list)  # always unioned in
@@ -231,10 +250,12 @@ class Config:
         cfg = cls()
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
                     "file_df_max", "token_df_max", "dir_df_max",
-                    "auto_specificity",
+                    "auto_specificity", "detect_workarounds",
                     "score_arch_threshold", "score_borderline_threshold"):
             if key in raw:
                 setattr(cfg, key, raw[key])
+        if "extra_workaround_markers" in raw:
+            cfg.extra_workaround_markers = list(raw["extra_workaround_markers"])
         if "stopwords" in raw:
             cfg.stopwords = frozenset(raw["stopwords"])
         if "extra_stopwords" in raw:
@@ -340,6 +361,8 @@ class Candidate:
     diff_summary: dict = field(default_factory=dict)
     range: Optional[tuple] = None
     merge_reasons: list = field(default_factory=list)
+    record_type: str = "decision"  # decision | workaround
+    workaround_signals: list = field(default_factory=list)
 
 
 # --- git helpers -------------------------------------------------------------
@@ -1341,6 +1364,74 @@ def classify(
     return score, cls, signals
 
 
+def scan_workarounds(repo: str, group: list[Commit],
+                     cfg: Config) -> tuple[str, list[str]]:
+    """Deterministic workaround detection over one candidate's commits.
+
+    Returns (record_type, signals). record_type flips to "workaround" only on
+    a STRONG signal — a marker pattern in an ADDED diff line, or a
+    workaround-shaped file (shim/adapter/polyfill/patches/) being added.
+    Message wording is recorded as a supporting signal but never flips alone.
+    Bounded: at most WORKAROUND_MAX_COMMITS commits / WORKAROUND_MAX_LINES
+    added lines are scanned per candidate, so large clusters stay cheap.
+    """
+    if not cfg.detect_workarounds or not repo:
+        return "decision", []
+    extra = []
+    for pat in cfg.extra_workaround_markers:
+        try:
+            extra.append(re.compile(pat, re.I))
+        except re.error:
+            pass
+
+    def hit(text: str) -> bool:
+        return bool(WORKAROUND_STRONG_RE.search(text)
+                    or WORKAROUND_COND_RE.search(text)
+                    or any(p.search(text) for p in extra))
+
+    signals: list[str] = []
+    strong = False
+
+    for c in group:
+        if hit(c.subject):
+            signals.append(f"workaround wording in message ({c.sha[:7]})")
+            break
+
+    for c in group:
+        shaped = next((f for f in c.files if f.status[0] in ("A", "R", "C")
+                       and WORKAROUND_FILE_RE.search(f.path)), None)
+        if shaped:
+            signals.append(f"workaround-shaped file added: {shaped.path}")
+            strong = True
+            break
+
+    scanned = 0
+    for c in group[:WORKAROUND_MAX_COMMITS]:
+        if scanned >= WORKAROUND_MAX_LINES:
+            break
+        try:
+            diff = git(repo, "show", "--format=", "--unified=0", c.sha)
+        except RuntimeError:
+            continue
+        for line in diff.splitlines():
+            if scanned >= WORKAROUND_MAX_LINES:
+                break
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            scanned += 1
+            content = line[1:]
+            if hit(content):
+                signals.append(
+                    f"workaround marker added ({c.sha[:7]}): "
+                    f"{content.strip()[:80]!r}")
+                strong = True
+                break  # one sample per commit is enough
+
+    if not strong:
+        return "decision", signals
+    return "workaround", signals
+
+
 def output_dir_for(code_scope: str) -> str:
     if code_scope.startswith("module:"):
         path = code_scope.split(":", 1)[1].rstrip("/")
@@ -1436,6 +1527,12 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             group, cfg, repo=repo, chunk_range=cluster_ranges.get(i - 1),
             split_reason=cluster_split_reasons.get(i - 1),
         )
+        record_type, wa_signals = scan_workarounds(repo, group, cfg)
+        if record_type == "workaround" and cls == "architectural":
+            # the decision dominates; surface the markers for the ADR prose
+            record_type = "decision"
+            wa_signals = ["WORKAROUND: markers present — note them inside "
+                          "the ADR"] + wa_signals
         all_files = sorted({f.path for c in group for f in c.files})
         dirs = sorted({d for c in group for d in c.top_dirs if d})
         toks = sorted({t for c in group for t in c.topic_tokens(cfg)})
@@ -1454,6 +1551,8 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
             diff_summary=diff_summary(group),
             range=cluster_ranges.get(i - 1),
             merge_reasons=cluster_merge_reasons.get(i - 1, []),
+            record_type=record_type,
+            workaround_signals=wa_signals,
         ))
 
     return {
@@ -1492,8 +1591,9 @@ def main() -> int:
         if pf.get("specificity_cap") is not None:
             print(f"specificity: df cap = {pf['specificity_cap']} (auto-tuned)")
         for c in manifest["candidates"]:
+            wa = "  [WA]" if c["record_type"] == "workaround" else ""
             print(f"  [{c['classification']:13}] score={c['score']:+d} "
-                  f"{c['id']} ({len(c['commits'])} commit) :: {c['title_hint']}")
+                  f"{c['id']} ({len(c['commits'])} commit){wa} :: {c['title_hint']}")
             print(f"      {c['diff_summary']['summary']}")
     return 0
 
