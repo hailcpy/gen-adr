@@ -2,6 +2,9 @@
 Tests for issue #39: build_coupling's per-commit changeset cap
 (coupling_max_changeset, config-overridable) and detect_strategy's rev_range
 scoping.
+
+Also tests for issue #38: mixed-strategy affinity-grouping of leftover
+linear commits, and the --strategy CLI override that bypasses detection.
 """
 import os
 import tempfile
@@ -95,3 +98,102 @@ def test_detect_strategy_scoped_to_rev_range():
 
         scoped = analyze.detect_strategy(tmp, pathspec=None, rev_range="v1..HEAD")
         assert scoped == "squash-boundary"  # no merges in this window
+
+
+# ---------------------------------------------------------------------------
+# issue #38: mixed strategy groups leftover linear commits; --strategy override
+# ---------------------------------------------------------------------------
+
+def _build_merge_heavy_repo_with_linear_tail(tmp):
+    """3 squash-referenced merges, then 4 related linear commits all touching
+    src/widget.py with a shared "widget" topic token — none covered by a
+    merge range."""
+    _init_repo(tmp)
+    with open(os.path.join(tmp, "README.md"), "w") as f:
+        f.write("init\n")
+    _commit(tmp, "init", "2024-01-01")
+
+    for i in range(3):
+        branch = f"feature{i}"
+        _sh("git", "checkout", "-q", "-b", branch, cwd=tmp)
+        with open(os.path.join(tmp, f"feat{i}.txt"), "w") as f:
+            f.write("x\n")
+        _commit(tmp, f"feat: feature {i} (#{i + 1})", f"2024-01-0{i + 2}")
+        _sh("git", "checkout", "-q", "main", cwd=tmp)
+        _sh("git", "merge", "--no-ff", "-q", "-m", f"Merge feature {i}", branch,
+            cwd=tmp, env=_date_env(f"2024-01-0{i + 2}"))
+
+    os.makedirs(os.path.join(tmp, "src"), exist_ok=True)
+    for i in range(4):
+        with open(os.path.join(tmp, "src", "widget.py"), "a") as f:
+            f.write(f"line {i}\n")
+        _commit(tmp, f"feat: widget step {i}", f"2024-02-0{i + 1}")
+
+
+def test_mixed_strategy_groups_leftover_linear_commits():
+    """Issue #38: a run of related linear commits not covered by any merge
+    range affinity-groups into one chunk, not 4 singletons."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _build_merge_heavy_repo_with_linear_tail(tmp)
+
+        strategy = analyze.detect_strategy(tmp, pathspec=None)
+        assert strategy == "mixed"
+
+        cfg = Config()
+        commits = analyze.parse_log(tmp, rev_range=None, pathspec=None)
+        coupling = analyze.build_coupling(tmp, cfg=cfg)
+        communities = analyze.build_leiden_communities(tmp)
+        cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max = \
+            analyze.resolve_specificity_caps(cfg, len(commits))
+        spec = analyze.build_specificity(commits, cfg)
+
+        chunks, ranges = analyze.chunk_commits(
+            commits, strategy, cfg, repo=tmp, pathspec=None,
+            coupling=coupling, communities=communities, spec=spec,
+        )
+
+        widget_chunks = [c for c in chunks
+                         if all("widget" in commit.subject for commit in c)]
+        assert len(widget_chunks) == 1, \
+            f"expected the 4 widget commits in one chunk, got {widget_chunks}"
+        assert len(widget_chunks[0]) == 4
+
+
+def test_strategy_direct_commit_bypasses_merge_enumeration():
+    """Issue #38: --strategy direct-commit on a merge-heavy repo skips merge
+    enumeration entirely — every chunk range is None, never a merge range."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _build_merge_heavy_repo_with_linear_tail(tmp)
+
+        # auto-detection would pick "mixed" (merge-boundary chunks for the
+        # 3 features), but the override forces direct-commit chunking.
+        assert analyze.detect_strategy(tmp, pathspec=None) == "mixed"
+
+        cfg = Config()
+        commits = analyze.parse_log(tmp, rev_range=None, pathspec=None)
+        coupling = analyze.build_coupling(tmp, cfg=cfg)
+        communities = analyze.build_leiden_communities(tmp)
+        cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max = \
+            analyze.resolve_specificity_caps(cfg, len(commits))
+        spec = analyze.build_specificity(commits, cfg)
+
+        chunks, ranges = analyze.chunk_commits(
+            commits, "direct-commit", cfg, repo=tmp, pathspec=None,
+            coupling=coupling, communities=communities, spec=spec,
+        )
+
+        assert sum(len(c) for c in chunks) == len(commits)
+        assert all(r is None for r in ranges.values())
+
+
+def test_analyze_strategy_override_reported_in_manifest():
+    """Issue #38: analyze(..., strategy="direct-commit") overrides detection
+    and the override is reflected in manifest["strategy"]."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _build_merge_heavy_repo_with_linear_tail(tmp)
+
+        auto = analyze.analyze(tmp)
+        assert auto["strategy"] == "mixed"
+
+        forced = analyze.analyze(tmp, strategy="direct-commit")
+        assert forced["strategy"] == "direct-commit"

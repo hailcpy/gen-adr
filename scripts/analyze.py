@@ -687,16 +687,25 @@ def chunk_commits(
                 idx = len(chunks)
                 chunks.append(chunk)
                 ranges[idx] = (base_sha, merge_sha)
-        # squash-style commits not covered by any merge range
-        for c in commits:
-            if c.sha not in seen:
-                seen.add(c.sha)
+        # commits not covered by any merge range: affinity-group them, same as
+        # direct-commit mode, instead of leaving each as an ungrouped singleton
+        # (a linear stretch of related commits would otherwise only merge if
+        # cluster() catches it later, which needs the 2-of-4 signal bar to fire
+        # pairwise on singletons).
+        leftover = [c for c in commits if c.sha not in seen]
+        if leftover:
+            for group in _affinity_groups(leftover, cfg, coupling=coupling,
+                                          communities=communities, spec=spec):
                 idx = len(chunks)
-                chunks.append([c])
-                if c.parents:
-                    ranges[idx] = (f"{c.sha}^", c.sha)
+                chunks.append(group)
+                if len(group) == 1:
+                    c = group[0]
+                    if c.parents:
+                        ranges[idx] = (f"{c.sha}^", c.sha)
+                    else:
+                        ranges[idx] = (_EMPTY_TREE, c.sha)
                 else:
-                    ranges[idx] = (_EMPTY_TREE, c.sha)
+                    ranges[idx] = None
         return chunks, ranges
 
     # direct-commit: affinity groups — no clean diff range per group
@@ -1490,7 +1499,7 @@ def output_dir_for(code_scope: str) -> str:
 
 
 def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
-            cfg: Optional[Config] = None) -> dict:
+            cfg: Optional[Config] = None, strategy: str = "auto") -> dict:
     # Work on a copy: analyze() sets several run-scoped fields (module_prefix,
     # resolved source_roots, auto-tuned specificity caps) on cfg. Mutating the
     # caller's object would leak this run's state into a second analyze() call
@@ -1555,7 +1564,11 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         cfg.source_roots = sorted(set(cfg.source_roots) | set(cfg.extra_source_roots))
     preflight["source_roots"] = cfg.source_roots
 
-    strategy = detect_strategy(repo, pathspec, rev_range)
+    # `strategy="auto"` (the default) detects from merge/squash shape; any other
+    # value bypasses detection entirely, e.g. to force direct-commit chunking on
+    # a merge-heavy repo.
+    effective_strategy = (detect_strategy(repo, pathspec, rev_range)
+                          if strategy == "auto" else strategy)
     commits = parse_log(repo, rev_range, pathspec)
     coupling = build_coupling(repo, pathspec, cfg)
     communities = build_leiden_communities(repo)
@@ -1565,7 +1578,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
     preflight["specificity_cap"] = cfg.file_df_max
     spec = build_specificity(commits, cfg)
     chunks, chunk_ranges = chunk_commits(
-        commits, strategy, cfg,
+        commits, effective_strategy, cfg,
         repo=repo, pathspec=pathspec,
         coupling=coupling, communities=communities, spec=spec,
     )
@@ -1613,7 +1626,7 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         "repo": repo,
         "scope": {"history": history_scope, "code": code_scope},
         "preflight": preflight,
-        "strategy": strategy,
+        "strategy": effective_strategy,
         "candidates": [asdict(c) for c in candidates],
     }
 
@@ -1625,6 +1638,10 @@ def main() -> int:
     ap.add_argument("--code", default="repo")
     ap.add_argument("--config", default=None,
                     help="path to a JSON config of pipeline knobs (see Config)")
+    ap.add_argument("--strategy", default="auto",
+                    choices=["auto", "merge-boundary", "squash-boundary",
+                             "direct-commit", "mixed"],
+                    help="override chunking strategy detection (default: auto-detect)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -1633,7 +1650,7 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as e:
         print(f"error: could not load config {args.config!r}: {e}", file=sys.stderr)
         return 2
-    manifest = analyze(args.repo, args.history, args.code, cfg)
+    manifest = analyze(args.repo, args.history, args.code, cfg, args.strategy)
     if args.json:
         print(json.dumps(manifest, indent=2))
     else:
