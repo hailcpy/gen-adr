@@ -51,10 +51,6 @@ _COUPLING_DENY_RE = re.compile(
     r"|(^|/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|poetry\.lock|cargo\.lock|gemfile\.lock|composer\.lock)$",
     re.I,
 )
-# A commit touching more files than this after filtering is a large refactor
-# or merge dump — its co-change signal is unreliable, so skip pair enumeration
-# for it entirely rather than pay O(k^2).
-_MAX_COUPLING_FILES_PER_COMMIT = 200
 
 # auto-tuned edge specificity (see Config.auto_specificity)
 AUTO_SPEC_MIN_COMMITS = 50   # below this, hotness isn't meaningful → no-op
@@ -229,6 +225,12 @@ class Config:
     # auto_specificity=False, to opt out. Below AUTO_SPEC_MIN_COMMITS it is a
     # no-op, so the small-fixture eval baseline is unchanged.
     auto_specificity: bool = True
+    # co-change coupling: commits touching more than this many files (after the
+    # lockfile/vendor/generated deny-filter) carry no reliable coupling signal
+    # and are skipped for pair enumeration entirely. Mirrors code-maat's
+    # --max-changeset-size (default 30) — without it, a single mega-commit
+    # generates O(k^2) pair increments and dominates build_coupling's runtime.
+    coupling_max_changeset: int = 30
     # classification
     score_arch_threshold: int = 3       # >= this -> architectural
     score_borderline_threshold: int = 1  # >= this (but < arch) -> borderline
@@ -247,7 +249,7 @@ class Config:
     _KNOWN_KEYS = frozenset({
         "min_dir_depth", "cluster_cap", "split_oversized",
         "file_df_max", "token_df_max", "dir_df_max",
-        "auto_specificity", "detect_workarounds",
+        "auto_specificity", "coupling_max_changeset", "detect_workarounds",
         "score_arch_threshold", "score_borderline_threshold",
         "extra_workaround_markers",
         "stopwords", "extra_stopwords",
@@ -270,7 +272,8 @@ class Config:
                 print(f"warning: unknown config key {key!r}{hint}", file=sys.stderr)
         for key in ("min_dir_depth", "cluster_cap", "split_oversized",
                     "file_df_max", "token_df_max", "dir_df_max",
-                    "auto_specificity", "detect_workarounds",
+                    "auto_specificity", "coupling_max_changeset",
+                    "detect_workarounds",
                     "score_arch_threshold", "score_borderline_threshold"):
             if key in raw:
                 setattr(cfg, key, raw[key])
@@ -548,12 +551,22 @@ def parse_log(repo: str, rev_range: Optional[str], pathspec: Optional[str],
     return commits
 
 
-def detect_strategy(repo: str, pathspec: Optional[str]) -> str:
+def detect_strategy(repo: str, pathspec: Optional[str],
+                    rev_range: Optional[str] = None) -> str:
+    """Detect chunking strategy from merge/squash shape.
+
+    Scoped to `rev_range` when given (a `since:<ref>` window) — otherwise a
+    repo that switched chunking style long ago would be classified by its
+    full, mostly-irrelevant history rather than the window being analyzed.
+    """
+    rev_args = [rev_range] if rev_range else []
     merge_count = len([l for l in git(
         repo, "log", "--merges", "--oneline",
+        *rev_args,
         *(["--", pathspec] if pathspec else [])
     ).splitlines() if l.strip()])
     subjects = git(repo, "log", "--no-merges", "--pretty=format:%s",
+                   *rev_args,
                    *(["--", pathspec] if pathspec else [])).splitlines()
     squash_count = sum(1 for s in subjects if PR_REF_RE.search(s))
 
@@ -696,7 +709,8 @@ def chunk_commits(
     return aff_chunks, aff_ranges
 
 
-def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
+def build_coupling(repo: str, pathspec: Optional[str] = None,
+                   cfg: Optional[Config] = None) -> dict:
     """Return frozenset({fileA, fileB}) → Jaccard coupling score over full history.
 
     Only pairs with ≥COUPLING_MIN_SHARED co-appearances and a score
@@ -704,6 +718,7 @@ def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
     Always mines the full history regardless of the analysis rev_range, since
     coupling is a global prior, not scoped to the current window.
     """
+    cfg = cfg or Config()
     commits = parse_log(repo, rev_range=None, pathspec=pathspec, no_merges=True)
     file_revs: dict[str, int] = {}
     pair_revs: dict = {}
@@ -712,7 +727,7 @@ def build_coupling(repo: str, pathspec: Optional[str] = None) -> dict:
         for p in paths:
             file_revs[p] = file_revs.get(p, 0) + 1
         paths = [p for p in paths if not _COUPLING_DENY_RE.search(p)]
-        if len(paths) > _MAX_COUPLING_FILES_PER_COMMIT:
+        if len(paths) > cfg.coupling_max_changeset:
             continue
         for i in range(len(paths)):
             for j in range(i + 1, len(paths)):
@@ -1540,9 +1555,9 @@ def analyze(repo: str, history_scope: str = "full", code_scope: str = "repo",
         cfg.source_roots = sorted(set(cfg.source_roots) | set(cfg.extra_source_roots))
     preflight["source_roots"] = cfg.source_roots
 
-    strategy = detect_strategy(repo, pathspec)
+    strategy = detect_strategy(repo, pathspec, rev_range)
     commits = parse_log(repo, rev_range, pathspec)
-    coupling = build_coupling(repo, pathspec)
+    coupling = build_coupling(repo, pathspec, cfg)
     communities = build_leiden_communities(repo)
     # auto-tune edge specificity from history size unless overridden
     cfg.file_df_max, cfg.token_df_max, cfg.dir_df_max = \
