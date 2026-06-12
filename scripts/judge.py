@@ -26,6 +26,7 @@ callable) so it stays unit-testable.
 
 Usage:
     python3 scripts/judge.py check-tags  <repo> <file> [<file> ...]
+    python3 scripts/judge.py check-links <repo> [--json]
     python3 scripts/judge.py verify-adr  <adr.md> --repo <repo> [--write] [--json]
     python3 scripts/judge.py verify-options <adr.md> --repo <repo> [--json]
     python3 scripts/judge.py judge-options  <adr.md> [--commits SHAs | --evidence f]
@@ -101,6 +102,8 @@ def check_tags(repo: str, paths: list[str]) -> dict:
         "results": [asdict(r) for r in results],
     }
 
+
+# --- ADR link integrity check ------------------------------------------------
 
 # --- evidence builder --------------------------------------------------------
 
@@ -757,6 +760,119 @@ _WALK_SKIP = frozenset({
 ISSUE_URL_RE = re.compile(
     r"https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+")
 _RECORD_NAME_RE = re.compile(r"^\d{4}-.*\.md$")
+ADR_TAG_RE = re.compile(
+    r"^\s*(?:#|//|/\*+|<!--)\s*"
+    r"(?P<tag>@ADR-\d{4}[-\w]*:[^\r\n]*?(?:—|--|-)\s*see\s+"
+    r"(?P<target>[^\s)]+\.md))"
+)
+
+
+@dataclass
+class AdrLinkTag:
+    path: str
+    line: int
+    target: str
+    status: str  # ok | dangling
+
+
+def _git_visible_files(repo: str) -> list[str]:
+    """Tracked plus untracked, non-ignored files, bounded by the local git view."""
+    res = subprocess.run(
+        ["git", "-C", repo, "ls-files", "--cached", "--others",
+         "--exclude-standard", "-z"],
+        capture_output=True, text=True,
+    )
+    if res.returncode == 0:
+        return sorted(p for p in res.stdout.split("\0") if p)
+
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _WALK_SKIP and not d.startswith(".")]
+        for fn in filenames:
+            out.append(os.path.relpath(os.path.join(dirpath, fn), repo))
+    return sorted(out)
+
+
+def _is_skipped_path(rel: str) -> bool:
+    parts = rel.split("/")
+    return any(p in _WALK_SKIP or p.startswith(".") for p in parts)
+
+
+def _normalize_adr_target(target: str) -> str:
+    cleaned = target.strip().rstrip(".,;:")
+    return os.path.normpath(cleaned).replace(os.sep, "/")
+
+
+def _adr_record_paths(repo: str, files: list[str]) -> list[str]:
+    out: list[str] = []
+    for rel in files:
+        if _is_skipped_path(rel):
+            continue
+        if not _RECORD_NAME_RE.match(os.path.basename(rel)):
+            continue
+        if not os.path.dirname(rel).replace(os.sep, "/").endswith("docs/decisions"):
+            continue
+        out.append(rel.replace(os.sep, "/"))
+    return sorted(out)
+
+
+def check_links(repo: str) -> dict:
+    """Report dangling @ADR source tags and orphaned ADR records.
+
+    Markdown files are intentionally excluded from tag scanning so fenced
+    documentation examples and ADR files are not treated as live source tags.
+    ADR records are still discovered under any docs/decisions dir.
+    """
+    files = _git_visible_files(repo)
+    records = _adr_record_paths(repo, files)
+    record_set = set(records)
+    inbound: Counter[str] = Counter()
+    tags: list[AdrLinkTag] = []
+
+    for rel in files:
+        rel = rel.replace(os.sep, "/")
+        if _is_skipped_path(rel) or rel.lower().endswith(".md"):
+            continue
+        full = os.path.join(repo, rel)
+        try:
+            with open(full, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            for match in ADR_TAG_RE.finditer(line):
+                target = _normalize_adr_target(match.group("target"))
+                status = "ok" if target in record_set else "dangling"
+                if status == "ok":
+                    inbound[target] += 1
+                tags.append(AdrLinkTag(rel, line_no, target, status))
+
+    dangling = [t for t in tags if t.status == "dangling"]
+    orphans = [r for r in records if inbound[r] == 0]
+    return {
+        "ok": not dangling,
+        "checked": len(tags),
+        "dangling": len(dangling),
+        "orphaned": len(orphans),
+        "tags": [asdict(t) for t in tags],
+        "orphans": orphans,
+    }
+
+
+def _cmd_check_links(args) -> int:
+    report = check_links(args.repo)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        for tag in report["tags"]:
+            if tag["status"] == "dangling":
+                print(f"dangling: {tag['path']}:{tag['line']} -> {tag['target']}")
+        for orphan in report["orphans"]:
+            print(f"orphaned: {orphan}")
+        print(f"{report['checked']} ADR tags checked; "
+              f"{report['dangling']} dangling; {report['orphaned']} orphaned")
+    return 1 if report["dangling"] else 0
 
 
 def find_workaround_records(repo: str) -> list[str]:
@@ -960,6 +1076,12 @@ def main() -> int:
     ct.add_argument("files", nargs="+")
     ct.add_argument("--json", action="store_true")
     ct.set_defaults(func=_cmd_check_tags)
+
+    cl = sub.add_parser("check-links",
+                        help="verify @ADR tags point at existing ADR records")
+    cl.add_argument("repo")
+    cl.add_argument("--json", action="store_true")
+    cl.set_defaults(func=_cmd_check_links)
 
     ev = sub.add_parser("evidence", help="build a judge evidence block from commit SHAs")
     ev.add_argument("repo")
