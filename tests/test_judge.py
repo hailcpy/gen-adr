@@ -8,6 +8,7 @@ No `claude -p` is ever spawned in the suite.
 """
 import json
 import shutil
+import subprocess
 
 import pytest
 
@@ -19,6 +20,7 @@ from judge import (
     build_evidence,
     build_options_judge_prompt,
     check_tag_syntax,
+    check_links,
     evidence_for_candidate,
     extract_options,
     judge_options,
@@ -66,6 +68,81 @@ def test_check_tags_aggregate(tmp_path):
     assert report["ok"] is False
     assert report["failed"] == 1
     assert report["checked"] == 3
+
+
+# --- ADR link integrity check ------------------------------------------------
+
+def _init_link_repo(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs" / "decisions").mkdir(parents=True)
+    return tmp_path
+
+
+def test_check_links_accepts_existing_record(tmp_path):
+    repo_dir = _init_link_repo(tmp_path)
+    (repo_dir / "src" / "service.py").write_text(
+        "# @ADR-0001-queue: adopt async queue — see "
+        "docs/decisions/0001-queue.md\n"
+    )
+    (repo_dir / "docs" / "decisions" / "0001-queue.md").write_text("# Queue\n")
+
+    report = check_links(str(repo_dir))
+
+    assert report["ok"] is True
+    assert report["checked"] == 1
+    assert report["dangling"] == 0
+    assert report["orphaned"] == 0
+    assert report["tags"][0]["target"] == "docs/decisions/0001-queue.md"
+
+
+def test_check_links_flags_dangling_tag(tmp_path):
+    repo_dir = _init_link_repo(tmp_path)
+    (repo_dir / "src" / "service.py").write_text(
+        "# @ADR-0002-cache: add cache — see docs/decisions/0002-cache.md\n"
+    )
+
+    report = check_links(str(repo_dir))
+
+    assert report["ok"] is False
+    assert report["dangling"] == 1
+    assert report["tags"][0]["status"] == "dangling"
+
+    res = _run_cli("check-links", str(repo_dir))
+    assert res.returncode == 1
+    assert "src/service.py:1" in res.stdout
+
+
+def test_check_links_reports_orphan_without_failing(tmp_path):
+    repo_dir = _init_link_repo(tmp_path)
+    (repo_dir / "docs" / "decisions" / "0003-orphan.md").write_text("# Orphan\n")
+
+    report = check_links(str(repo_dir))
+
+    assert report["ok"] is True
+    assert report["checked"] == 0
+    assert report["orphaned"] == 1
+
+    res = _run_cli("check-links", str(repo_dir))
+    assert res.returncode == 0
+    assert "orphaned: docs/decisions/0003-orphan.md" in res.stdout
+
+
+def test_check_links_respects_gitignore_and_ignores_markdown_examples(tmp_path):
+    repo_dir = _init_link_repo(tmp_path)
+    (repo_dir / ".gitignore").write_text("ignored.py\n")
+    (repo_dir / "ignored.py").write_text(
+        "# @ADR-0004-ignored: ignored — see docs/decisions/0004-ignored.md\n"
+    )
+    (repo_dir / "README.md").write_text(
+        "# @ADR-9999-example: example — see docs/decisions/9999-example.md\n"
+    )
+
+    report = check_links(str(repo_dir))
+
+    assert report["ok"] is True
+    assert report["checked"] == 0
+    assert report["dangling"] == 0
 
 
 # --- options extraction ------------------------------------------------------
